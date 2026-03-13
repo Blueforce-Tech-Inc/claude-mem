@@ -48,6 +48,32 @@ export function useContextPreview(settings: Settings): UseContextPreviewResult {
       project: selectedProject
     });
 
+    // Add filter parameters from settings
+    const observationTypes = settings.CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES?.trim();
+    const concepts = settings.CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS?.trim();
+    // Use CLAUDE_MEM_CONTEXT_OBSERVATIONS (from UI "Observations" input) for maxObservations
+    const maxObservations = settings.CLAUDE_MEM_CONTEXT_OBSERVATIONS?.trim();
+    // Use CLAUDE_MEM_CONTEXT_SESSION_COUNT (from UI "Sessions" input) for sessionCount
+    const sessionCount = settings.CLAUDE_MEM_CONTEXT_SESSION_COUNT?.trim();
+    // Use CLAUDE_MEM_CONTEXT_FULL_COUNT (from UI Display "Count" input) for fullCount
+    const fullCount = settings.CLAUDE_MEM_CONTEXT_FULL_COUNT?.trim();
+
+    if (observationTypes) {
+      params.set('observationTypes', observationTypes);
+    }
+    if (concepts) {
+      params.set('concepts', concepts);
+    }
+    if (maxObservations) {
+      params.set('maxObservations', maxObservations);
+    }
+    if (sessionCount) {
+      params.set('sessionCount', sessionCount);
+    }
+    if (fullCount) {
+      params.set('fullCount', fullCount);
+    }
+
     const response = await fetch(`/api/context/preview?${params}`);
     const text = await response.text();
 
@@ -58,7 +84,7 @@ export function useContextPreview(settings: Settings): UseContextPreviewResult {
     }
 
     setIsLoading(false);
-  }, [selectedProject]);
+  }, [selectedProject, settings]);
 
   // Debounced refresh when settings or selectedProject change
   useEffect(() => {
