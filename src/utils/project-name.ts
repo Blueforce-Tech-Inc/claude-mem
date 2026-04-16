@@ -1,12 +1,24 @@
+import { homedir } from 'os'
 import path from 'path';
 import { logger } from './logger.js';
 import { detectWorktree } from './worktree.js';
 
 /**
+ * Expand leading ~ to the user's home directory.
+ * Handles "~", "~/", and "~/subpath" but not "~user/" (which is rare in cwd).
+ */
+function expandTilde(p: string): string {
+  if (p === '~' || p.startsWith('~/')) {
+    return p.replace(/^~/, homedir())
+  }
+  return p
+}
+
+/**
  * Extract project name from working directory path
- * Handles edge cases: null/undefined cwd, drive roots, trailing slashes
+ * Handles edge cases: null/undefined cwd, drive roots, trailing slashes, unexpanded ~
  *
- * @param cwd - Current working directory (absolute path)
+ * @param cwd - Current working directory (absolute path, or ~-prefixed path)
  * @returns Project name or "unknown-project" if extraction fails
  */
 export function getProjectName(cwd: string | null | undefined): string {
@@ -15,8 +27,11 @@ export function getProjectName(cwd: string | null | undefined): string {
     return 'unknown-project';
   }
 
+  // Expand leading ~ before path operations
+  const expanded = expandTilde(cwd)
+
   // Extract basename (handles trailing slashes automatically)
-  const basename = path.basename(cwd);
+  const basename = path.basename(expanded);
 
   // Edge case: Drive roots on Windows (C:\, J:\) or Unix root (/)
   // path.basename('C:\') returns '' (empty string)
@@ -43,13 +58,13 @@ export function getProjectName(cwd: string | null | undefined): string {
  * Project context with worktree awareness
  */
 export interface ProjectContext {
-  /** The current project name (worktree or main repo) */
+  /** Canonical project name for writes/queries (parent repo in worktrees) */
   primary: string;
   /** Parent project name if in a worktree, null otherwise */
   parent: string | null;
   /** True if currently in a worktree */
   isWorktree: boolean;
-  /** All projects to query: [primary] for main repo, [parent, primary] for worktree */
+  /** All projects to query: [primary] for main repo, [parentRepo, worktreeName] for worktree */
   allProjects: string[];
 }
 
@@ -63,23 +78,26 @@ export interface ProjectContext {
  * @returns ProjectContext with worktree info
  */
 export function getProjectContext(cwd: string | null | undefined): ProjectContext {
-  const primary = getProjectName(cwd);
+  const cwdProjectName = getProjectName(cwd);
 
   if (!cwd) {
-    return { primary, parent: null, isWorktree: false, allProjects: [primary] };
+    return { primary: cwdProjectName, parent: null, isWorktree: false, allProjects: [cwdProjectName] };
   }
 
-  const worktreeInfo = detectWorktree(cwd);
+  const expandedCwd = expandTilde(cwd);
+  const worktreeInfo = detectWorktree(expandedCwd);
 
   if (worktreeInfo.isWorktree && worktreeInfo.parentProjectName) {
-    // In a worktree: include parent first for chronological ordering
+    // In a worktree: use parent project name as primary so observations
+    // are stored under the same project as the main repo (#1081, #1500, #1819)
+    const allProjects = Array.from(new Set([worktreeInfo.parentProjectName, cwdProjectName]));
     return {
-      primary,
+      primary: worktreeInfo.parentProjectName,
       parent: worktreeInfo.parentProjectName,
       isWorktree: true,
-      allProjects: [worktreeInfo.parentProjectName, primary]
+      allProjects
     };
   }
 
-  return { primary, parent: null, isWorktree: false, allProjects: [primary] };
+  return { primary: cwdProjectName, parent: null, isWorktree: false, allProjects: [cwdProjectName] };
 }

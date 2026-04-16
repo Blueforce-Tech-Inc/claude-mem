@@ -50,9 +50,8 @@ export function parseObservations(text: string, correlationId?: string): ParsedO
     const files_read = extractArrayElements(obsContent, 'files_read', 'file');
     const files_modified = extractArrayElements(obsContent, 'files_modified', 'file');
 
-    // NOTE FROM THEDOTMACK: ALWAYS save observations - never skip. 10/24/2025
-    // All fields except type are nullable in schema
-    // If type is missing or invalid, use first type from mode as fallback
+    // All fields except type are nullable in schema.
+    // If type is missing or invalid, use first type from mode as fallback.
 
     // Determine final type using active mode's valid types
     const mode = ModeManager.getInstance().getActiveMode();
@@ -81,6 +80,19 @@ export function parseObservations(text: string, correlationId?: string): ParsedO
         originalConcepts: concepts,
         cleanedConcepts
       });
+    }
+
+    // Skip ghost observations — records where every content field is null/empty.
+    // These accumulate when the LLM emits a bare <observation/> (or one with only <type>)
+    // due to context overflow. They carry no information and pollute the context window.
+    // (subtitle and file lists are intentionally excluded from this guard: an observation
+    // with only a subtitle is still too thin to be useful on its own.)
+    if (!title && !narrative && facts.length === 0 && cleanedConcepts.length === 0) {
+      logger.warn('PARSER', 'Skipping empty observation (all content fields null)', {
+        correlationId,
+        type: finalType
+      });
+      continue;
     }
 
     observations.push({
@@ -138,7 +150,7 @@ export function parseSummary(text: string, sessionId?: number): ParsedSummary | 
   const next_steps = extractField(summaryContent, 'next_steps');
   const notes = extractField(summaryContent, 'notes'); // Optional
 
-  // NOTE FROM THEDOTMACK: 100% of the time we must SAVE the summary, even if fields are missing. 10/24/2025 
+  // NOTE FROM THEDOTMACK: 100% of the time we must SAVE the summary, even if fields are missing. 10/24/2025
   // NEVER DO THIS NONSENSE AGAIN.
 
   // Validate required fields are present (notes is optional)
@@ -153,6 +165,15 @@ export function parseSummary(text: string, sessionId?: number): ParsedSummary | 
   //   });
   //   return null;
   // }
+
+  // Guard: if NO sub-tags matched at all, this is a false positive —
+  // <summary> accidentally appeared inside an <observation> response with no structured content.
+  // This is NOT the same as missing some fields (which we intentionally allow above).
+  // Fix for #1360.
+  if (!request && !investigated && !learned && !completed && !next_steps) {
+    logger.warn('PARSER', 'Summary match has no sub-tags — skipping false positive', { sessionId });
+    return null;
+  }
 
   return {
     request,

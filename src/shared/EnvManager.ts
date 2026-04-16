@@ -9,7 +9,7 @@
  * causing memory operations to bill personal API accounts instead of CLI subscription.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
@@ -40,6 +40,7 @@ export const MANAGED_CREDENTIAL_KEYS = [
 export interface ClaudeMemEnv {
   // Credentials (optional - empty means use CLI billing for Claude)
   ANTHROPIC_API_KEY?: string;
+  ANTHROPIC_BASE_URL?: string;
   GEMINI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
 }
@@ -115,6 +116,7 @@ export function loadClaudeMemEnv(): ClaudeMemEnv {
     // Only return managed credential keys
     const result: ClaudeMemEnv = {};
     if (parsed.ANTHROPIC_API_KEY) result.ANTHROPIC_API_KEY = parsed.ANTHROPIC_API_KEY;
+    if (parsed.ANTHROPIC_BASE_URL) result.ANTHROPIC_BASE_URL = parsed.ANTHROPIC_BASE_URL;
     if (parsed.GEMINI_API_KEY) result.GEMINI_API_KEY = parsed.GEMINI_API_KEY;
     if (parsed.OPENROUTER_API_KEY) result.OPENROUTER_API_KEY = parsed.OPENROUTER_API_KEY;
 
@@ -130,10 +132,13 @@ export function loadClaudeMemEnv(): ClaudeMemEnv {
  */
 export function saveClaudeMemEnv(env: ClaudeMemEnv): void {
   try {
-    // Ensure directory exists
+    // Ensure directory exists with restricted permissions (owner only)
     if (!existsSync(DATA_DIR)) {
-      mkdirSync(DATA_DIR, { recursive: true });
+      mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
     }
+    // Fix permissions on pre-existing directories (mode: is only applied on creation)
+    // Note: On Windows, chmod has no effect — permissions are controlled via ACLs.
+    chmodSync(DATA_DIR, 0o700);
 
     // Load existing to preserve any extra keys
     const existing = existsSync(ENV_FILE_PATH)
@@ -151,6 +156,13 @@ export function saveClaudeMemEnv(env: ClaudeMemEnv): void {
         delete updated.ANTHROPIC_API_KEY;
       }
     }
+    if (env.ANTHROPIC_BASE_URL !== undefined) {
+      if (env.ANTHROPIC_BASE_URL) {
+        updated.ANTHROPIC_BASE_URL = env.ANTHROPIC_BASE_URL;
+      } else {
+        delete updated.ANTHROPIC_BASE_URL;
+      }
+    }
     if (env.GEMINI_API_KEY !== undefined) {
       if (env.GEMINI_API_KEY) {
         updated.GEMINI_API_KEY = env.GEMINI_API_KEY;
@@ -166,7 +178,11 @@ export function saveClaudeMemEnv(env: ClaudeMemEnv): void {
       }
     }
 
-    writeFileSync(ENV_FILE_PATH, serializeEnvFile(updated), 'utf-8');
+    writeFileSync(ENV_FILE_PATH, serializeEnvFile(updated), { encoding: 'utf-8', mode: 0o600 });
+    // Explicitly set permissions in case the file already existed before this fix.
+    // writeFileSync's mode option only applies on file creation (O_CREAT), not on overwrites.
+    // Note: On Windows, chmod has no effect — permissions are controlled via ACLs.
+    chmodSync(ENV_FILE_PATH, 0o600);
   } catch (error) {
     logger.error('ENV', 'Failed to save .env file', { path: ENV_FILE_PATH }, error as Error);
     throw error;
@@ -209,6 +225,12 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
     // If not configured, CLI billing will be used (via ANTHROPIC_AUTH_TOKEN passthrough)
     if (credentials.ANTHROPIC_API_KEY) {
       isolatedEnv.ANTHROPIC_API_KEY = credentials.ANTHROPIC_API_KEY;
+    }
+    // Override ANTHROPIC_BASE_URL from .env if configured
+    // This ensures the SDK subprocess uses a stable API endpoint instead of
+    // inheriting a dynamic local proxy port that may become stale
+    if (credentials.ANTHROPIC_BASE_URL) {
+      isolatedEnv.ANTHROPIC_BASE_URL = credentials.ANTHROPIC_BASE_URL;
     }
     // Note: GEMINI_API_KEY and OPENROUTER_API_KEY pass through from process.env,
     // but claude-mem's .env takes precedence if configured

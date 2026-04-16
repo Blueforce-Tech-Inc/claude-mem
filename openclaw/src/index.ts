@@ -183,6 +183,7 @@ interface ClaudeMemPluginConfig {
   syncMemoryFileExclude?: string[];
   project?: string;
   workerPort?: number;
+  workerHost?: string;
   observationFeed?: {
     enabled?: boolean;
     channel?: string;
@@ -198,6 +199,7 @@ interface ClaudeMemPluginConfig {
 
 const MAX_SSE_BUFFER_SIZE = 1024 * 1024; // 1MB
 const DEFAULT_WORKER_PORT = 37777;
+const DEFAULT_WORKER_HOST = "127.0.0.1";
 
 // Emoji pool for deterministic auto-assignment to unknown agents.
 // Uses a hash of the agentId to pick a consistent emoji — no persistent state needed.
@@ -256,8 +258,77 @@ function buildGetSourceLabel(
 // Worker HTTP Client
 // ============================================================================
 
+let _workerHost = DEFAULT_WORKER_HOST;
+
 function workerBaseUrl(port: number): string {
-  return `http://127.0.0.1:${port}`;
+  return `http://${_workerHost}:${port}`;
+}
+
+// ============================================================================
+// Worker Circuit Breaker
+// ============================================================================
+// Prevents CPU-spinning retry loops when the worker is unreachable.
+// After CIRCUIT_BREAKER_THRESHOLD consecutive network errors, the circuit
+// opens and all worker calls are silently dropped for CIRCUIT_BREAKER_COOLDOWN_MS.
+// After the cooldown, one probe attempt is allowed to check if the worker recovered.
+
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
+
+type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
+
+let _circuitState: CircuitState = "CLOSED";
+let _circuitFailures = 0;
+let _circuitOpenedAt = 0;
+let _halfOpenProbeInFlight = false;
+
+function circuitAllow(logger: PluginLogger): boolean {
+  if (_circuitState === "CLOSED") return true;
+  if (_circuitState === "OPEN") {
+    if (Date.now() - _circuitOpenedAt >= CIRCUIT_BREAKER_COOLDOWN_MS) {
+      _circuitState = "HALF_OPEN";
+      logger.info("[claude-mem] Circuit breaker: probing worker connection");
+      if (_halfOpenProbeInFlight) return false;
+      _halfOpenProbeInFlight = true;
+      return true;
+    }
+    return false;
+  }
+  // HALF_OPEN: allow one probe through
+  if (_halfOpenProbeInFlight) return false;
+  _halfOpenProbeInFlight = true;
+  return true;
+}
+
+function circuitOnSuccess(logger: PluginLogger): void {
+  if (_circuitState !== "CLOSED") {
+    logger.info("[claude-mem] Worker connection restored — circuit closed");
+  }
+  _circuitState = "CLOSED";
+  _circuitFailures = 0;
+  _halfOpenProbeInFlight = false;
+}
+
+function circuitOnFailure(logger: PluginLogger): void {
+  _halfOpenProbeInFlight = false;
+  _circuitFailures++;
+  if (
+    _circuitState === "HALF_OPEN" ||
+    (_circuitState === "CLOSED" && _circuitFailures >= CIRCUIT_BREAKER_THRESHOLD)
+  ) {
+    _circuitState = "OPEN";
+    _circuitOpenedAt = Date.now();
+    logger.warn(
+      `[claude-mem] Worker unreachable — disabling requests for ${CIRCUIT_BREAKER_COOLDOWN_MS / 1000}s`
+    );
+  }
+}
+
+function circuitReset(): void {
+  _circuitState = "CLOSED";
+  _circuitFailures = 0;
+  _circuitOpenedAt = 0;
+  _halfOpenProbeInFlight = false;
 }
 
 async function workerPost(
@@ -266,6 +337,7 @@ async function workerPost(
   body: Record<string, unknown>,
   logger: PluginLogger
 ): Promise<Record<string, unknown> | null> {
+  if (!circuitAllow(logger)) return null;
   try {
     const response = await fetch(`${workerBaseUrl(port)}${path}`, {
       method: "POST",
@@ -273,13 +345,18 @@ async function workerPost(
       body: JSON.stringify(body),
     });
     if (!response.ok) {
+      circuitOnFailure(logger);
       logger.warn(`[claude-mem] Worker POST ${path} returned ${response.status}`);
       return null;
     }
+    circuitOnSuccess(logger);
     return (await response.json()) as Record<string, unknown>;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    logger.warn(`[claude-mem] Worker POST ${path} failed: ${message}`);
+    circuitOnFailure(logger);
+    if (_circuitState !== "OPEN") {
+      logger.warn(`[claude-mem] Worker POST ${path} failed: ${message}`);
+    }
     return null;
   }
 }
@@ -290,13 +367,24 @@ function workerPostFireAndForget(
   body: Record<string, unknown>,
   logger: PluginLogger
 ): void {
+  if (!circuitAllow(logger)) return;
   fetch(`${workerBaseUrl(port)}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  }).then((response) => {
+    if (!response.ok) {
+      circuitOnFailure(logger);
+      logger.warn(`[claude-mem] Worker POST ${path} returned ${response.status}`);
+      return;
+    }
+    circuitOnSuccess(logger);
   }).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    logger.warn(`[claude-mem] Worker POST ${path} failed: ${message}`);
+    circuitOnFailure(logger);
+    if (_circuitState !== "OPEN") {
+      logger.warn(`[claude-mem] Worker POST ${path} failed: ${message}`);
+    }
   });
 }
 
@@ -305,16 +393,22 @@ async function workerGetText(
   path: string,
   logger: PluginLogger
 ): Promise<string | null> {
+  if (!circuitAllow(logger)) return null;
   try {
     const response = await fetch(`${workerBaseUrl(port)}${path}`);
     if (!response.ok) {
+      circuitOnFailure(logger);
       logger.warn(`[claude-mem] Worker GET ${path} returned ${response.status}`);
       return null;
     }
+    circuitOnSuccess(logger);
     return await response.text();
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    logger.warn(`[claude-mem] Worker GET ${path} failed: ${message}`);
+    circuitOnFailure(logger);
+    if (_circuitState !== "OPEN") {
+      logger.warn(`[claude-mem] Worker GET ${path} failed: ${message}`);
+    }
     return null;
   }
 }
@@ -533,6 +627,7 @@ async function connectToSSEStream(
 export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   const userConfig = (api.pluginConfig || {}) as ClaudeMemPluginConfig;
   const workerPort = userConfig.workerPort || DEFAULT_WORKER_PORT;
+  _workerHost = userConfig.workerHost || DEFAULT_WORKER_HOST;
   const baseProjectName = userConfig.project || "openclaw";
   const getSourceLabel = buildGetSourceLabel(userConfig.observationFeed?.emojis);
 
@@ -547,6 +642,14 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   // Session tracking for observation I/O
   // ------------------------------------------------------------------
   const sessionIds = new Map<string, string>();
+  const canonicalSessionKeys = new Map<string, string>();
+  const sessionAliasesByCanonicalKey = new Map<string, Set<string>>();
+  const pendingCompletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const recentPromptInits = new Map<string, number>();
+  const completionDelayMs = (() => {
+    const val = Number((userConfig as Record<string, unknown>).completionDelayMs);
+    return Number.isFinite(val) ? Math.max(0, val) : 5000;
+  })();
   const syncMemoryFile = userConfig.syncMemoryFile !== false; // default true
   const syncMemoryFileExclude = new Set(userConfig.syncMemoryFileExclude || []);
 
@@ -563,6 +666,83 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     const agentId = ctx?.agentId;
     if (agentId && syncMemoryFileExclude.has(agentId)) return false;
     return true;
+  }
+
+  type SessionTrackingContext = {
+    sessionKey?: string;
+    workspaceDir?: string;
+    channelId?: string;
+    conversationId?: string;
+  };
+
+  function getSessionAliases(ctx: SessionTrackingContext): string[] {
+    const aliases = new Set<string>();
+    for (const rawKey of [ctx.sessionKey, ctx.conversationId, ctx.channelId]) {
+      const key = typeof rawKey === "string" ? rawKey.trim() : "";
+      if (key) aliases.add(key);
+    }
+    if (aliases.size === 0) aliases.add("default");
+    return Array.from(aliases);
+  }
+
+  function rememberSessionContext(ctx: SessionTrackingContext): { canonicalKey: string; contentSessionId: string } {
+    const aliases = getSessionAliases(ctx);
+    let canonicalKey = aliases.find((alias) => canonicalSessionKeys.has(alias));
+    canonicalKey = canonicalKey ? canonicalSessionKeys.get(canonicalKey)! : aliases[0];
+    let aliasSet = sessionAliasesByCanonicalKey.get(canonicalKey);
+    if (!aliasSet) {
+      aliasSet = new Set([canonicalKey]);
+      sessionAliasesByCanonicalKey.set(canonicalKey, aliasSet);
+    }
+    for (const alias of aliases) {
+      aliasSet.add(alias);
+      canonicalSessionKeys.set(alias, canonicalKey);
+    }
+    const contentSessionId = getContentSessionId(canonicalKey);
+    for (const alias of aliasSet) {
+      sessionIds.set(alias, contentSessionId);
+    }
+    return { canonicalKey, contentSessionId };
+  }
+
+  function shouldSkipDuplicatePromptInit(contentSessionId: string, project: string, prompt: string): boolean {
+    const now = Date.now();
+    for (const [key, timestamp] of recentPromptInits) {
+      if (now - timestamp > 2000) recentPromptInits.delete(key);
+    }
+    const cacheKey = `${contentSessionId}::${project}::${prompt}`;
+    const lastSeenAt = recentPromptInits.get(cacheKey);
+    // Note: cache is set unconditionally before return. If workerPost fails
+    // after this check, a retry within 2s would be incorrectly skipped.
+    // Acceptable because before_agent_start is not retried by the runtime.
+    recentPromptInits.set(cacheKey, now);
+    return typeof lastSeenAt === "number" && now - lastSeenAt <= 2000;
+  }
+
+  function clearSessionContext(ctx: SessionTrackingContext): void {
+    const aliases = getSessionAliases(ctx);
+    const canonicalKey = aliases
+      .map((alias) => canonicalSessionKeys.get(alias))
+      .find(Boolean) || aliases[0];
+    const knownAliases = sessionAliasesByCanonicalKey.get(canonicalKey) || new Set([canonicalKey, ...aliases]);
+    for (const alias of knownAliases) {
+      canonicalSessionKeys.delete(alias);
+      sessionIds.delete(alias);
+    }
+    sessionAliasesByCanonicalKey.delete(canonicalKey);
+    sessionIds.delete(canonicalKey);
+  }
+
+  function scheduleSessionComplete(contentSessionId: string): void {
+    const existingTimer = pendingCompletionTimers.get(contentSessionId);
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      pendingCompletionTimers.delete(contentSessionId);
+      workerPostFireAndForget(workerPort, "/api/sessions/complete", {
+        contentSessionId,
+      }, api.logger);
+    }, completionDelayMs);
+    pendingCompletionTimers.set(contentSessionId, timer);
   }
 
   // TTL cache for context injection to avoid re-fetching on every LLM turn.
@@ -600,61 +780,54 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   }
 
   // ------------------------------------------------------------------
-  // Event: session_start — init claude-mem session (fires on /new, /reset)
+  // Event: session_start — track session (fires on /new, /reset)
+  // Init is deferred to before_agent_start to avoid duplicate prompt records.
   // ------------------------------------------------------------------
   api.on("session_start", async (_event, ctx) => {
-    const contentSessionId = getContentSessionId(ctx.sessionKey);
-
-    await workerPost(workerPort, "/api/sessions/init", {
-      contentSessionId,
-      project: getProjectName(ctx),
-      prompt: "",
-    }, api.logger);
-
-    api.logger.info(`[claude-mem] Session initialized: ${contentSessionId}`);
+    const { contentSessionId } = rememberSessionContext(ctx);
+    api.logger.info(`[claude-mem] Session tracking initialized: ${contentSessionId}`);
   });
 
   // ------------------------------------------------------------------
-  // Event: message_received — capture inbound user prompts from channels
+  // Event: message_received — alias tracking only; init deferred to before_agent_start
   // ------------------------------------------------------------------
   api.on("message_received", async (event, ctx) => {
-    const sessionKey = ctx.conversationId || ctx.channelId || "default";
-    const contentSessionId = getContentSessionId(sessionKey);
-
-    await workerPost(workerPort, "/api/sessions/init", {
-      contentSessionId,
-      project: baseProjectName,
-      prompt: event.content || "[media prompt]",
-    }, api.logger);
+    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+    api.logger.info(`[claude-mem] Message received — prompt capture deferred to before_agent_start: session=${canonicalKey} contentSessionId=${contentSessionId} hasContent=${Boolean(event.content)}`);
   });
 
   // ------------------------------------------------------------------
-  // Event: after_compaction — re-init session after context compaction
+  // Event: after_compaction — preserve session tracking after context compaction.
+  // Re-init is intentionally NOT called here; the worker retains session state
+  // independently and re-initializing would create duplicate prompt records.
   // ------------------------------------------------------------------
   api.on("after_compaction", async (_event, ctx) => {
-    const contentSessionId = getContentSessionId(ctx.sessionKey);
-
-    await workerPost(workerPort, "/api/sessions/init", {
-      contentSessionId,
-      project: getProjectName(ctx),
-      prompt: "",
-    }, api.logger);
-
-    api.logger.info(`[claude-mem] Session re-initialized after compaction: ${contentSessionId}`);
+    const { contentSessionId } = rememberSessionContext(ctx);
+    api.logger.info(`[claude-mem] Session preserved after compaction: ${contentSessionId}`);
   });
 
   // ------------------------------------------------------------------
-  // Event: before_agent_start — init session
+  // Event: before_agent_start — single init point with dedup guard
   // ------------------------------------------------------------------
   api.on("before_agent_start", async (event, ctx) => {
+    const { contentSessionId } = rememberSessionContext(ctx);
+    const projectName = getProjectName(ctx);
+    const promptText = event.prompt || "agent run";
+
+    if (shouldSkipDuplicatePromptInit(contentSessionId, projectName, promptText)) {
+      api.logger.info(`[claude-mem] Skipping duplicate prompt init: contentSessionId=${contentSessionId} project=${projectName}`);
+      return;
+    }
+
     // Initialize session in the worker so observations are not skipped
     // (the privacy check requires a stored user prompt to exist)
-    const contentSessionId = getContentSessionId(ctx.sessionKey);
     await workerPost(workerPort, "/api/sessions/init", {
       contentSessionId,
-      project: getProjectName(ctx),
-      prompt: event.prompt || "agent run",
+      project: projectName,
+      prompt: promptText,
     }, api.logger);
+
+    api.logger.info(`[claude-mem] Session initialized via before_agent_start: contentSessionId=${contentSessionId} project=${projectName}`);
   });
 
   // ------------------------------------------------------------------
@@ -686,7 +859,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     // Skip memory_ tools to prevent recursive observation loops
     if (toolName.startsWith("memory_")) return;
 
-    const contentSessionId = getContentSessionId(ctx.sessionKey);
+    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
 
     // Extract result text from all content blocks
     let toolResponseText = "";
@@ -704,13 +877,23 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       toolResponseText = toolResponseText.slice(0, MAX_TOOL_RESPONSE_LENGTH);
     }
 
+    // Resolve workspaceDir with fallback chain.
+    // Empty cwd causes worker-side observation queueing failures,
+    // so we drop the observation rather than sending cwd: "".
+    const workspaceDir = ctx.workspaceDir;
+
+    if (!workspaceDir) {
+      api.logger.warn(`[claude-mem] Skipping observation persist because workspaceDir is unavailable: session=${canonicalKey} tool=${toolName}`);
+      return;
+    }
+
     // Fire-and-forget: send observation to worker
     workerPostFireAndForget(workerPort, "/api/sessions/observations", {
       contentSessionId,
       tool_name: toolName,
       tool_input: event.params || {},
       tool_response: toolResponseText,
-      cwd: "",
+      cwd: workspaceDir,
     }, api.logger);
   });
 
@@ -718,7 +901,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   // Event: agent_end — summarize and complete session
   // ------------------------------------------------------------------
   api.on("agent_end", async (event, ctx) => {
-    const contentSessionId = getContentSessionId(ctx.sessionKey);
+    const { contentSessionId } = rememberSessionContext(ctx);
 
     // Extract last assistant message for summarization
     let lastAssistantMessage = "";
@@ -747,25 +930,32 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       last_assistant_message: lastAssistantMessage,
     }, api.logger);
 
-    workerPostFireAndForget(workerPort, "/api/sessions/complete", {
-      contentSessionId,
-    }, api.logger);
+    api.logger.info(`[claude-mem] Scheduling session complete in ${completionDelayMs}ms: ${contentSessionId}`);
+    scheduleSessionComplete(contentSessionId);
   });
 
   // ------------------------------------------------------------------
   // Event: session_end — clean up session tracking to prevent unbounded growth
   // ------------------------------------------------------------------
   api.on("session_end", async (_event, ctx) => {
-    const key = ctx.sessionKey || "default";
-    sessionIds.delete(key);
+    clearSessionContext(ctx);
+    api.logger.info(`[claude-mem] Session tracking cleaned up`);
   });
 
   // ------------------------------------------------------------------
   // Event: gateway_start — clear session tracking for fresh start
   // ------------------------------------------------------------------
   api.on("gateway_start", async () => {
+    circuitReset();
     sessionIds.clear();
     contextCache.clear();
+    recentPromptInits.clear();
+    canonicalSessionKeys.clear();
+    sessionAliasesByCanonicalKey.clear();
+    for (const timer of pendingCompletionTimers.values()) {
+      clearTimeout(timer);
+    }
+    pendingCompletionTimers.clear();
     api.logger.info("[claude-mem] Gateway started — session tracking reset");
   });
 
@@ -1047,5 +1237,5 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     },
   });
 
-  api.logger.info(`[claude-mem] OpenClaw plugin loaded — v1.0.0 (worker: 127.0.0.1:${workerPort})`);
+  api.logger.info(`[claude-mem] OpenClaw plugin loaded — v1.0.0 (worker: ${_workerHost}:${workerPort})`);
 }

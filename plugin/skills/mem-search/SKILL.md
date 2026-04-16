@@ -125,3 +125,7 @@ get_observations(ids=[11131, 10942, 10855], orderBy="date_desc")
 - **Full observation:** ~500-1000 tokens each
 - **Batch fetch:** 1 HTTP request vs N individual requests
 - **10x token savings** by filtering before fetching
+
+## Knowledge Agents
+
+Want synthesized answers instead of raw records? Use `/knowledge-agent` to build a queryable corpus from your observation history. The knowledge agent reads all matching observations and answers questions conversationally.

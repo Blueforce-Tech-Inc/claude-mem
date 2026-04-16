@@ -54,7 +54,8 @@ export async function processAgentResponse(
   discoveryTokens: number,
   originalTimestamp: number | null,
   agentName: string,
-  projectRoot?: string
+  projectRoot?: string,
+  modelId?: string
 ): Promise<void> {
   // Track generator activity for stale detection (Issue #1099)
   session.lastGeneratorActivity = Date.now();
@@ -115,7 +116,8 @@ export async function processAgentResponse(
     summaryForStore,
     session.lastPromptNumber,
     discoveryTokens,
-    originalTimestamp ?? undefined
+    originalTimestamp ?? undefined,
+    modelId
   );
 
   // Log storage result with IDs for end-to-end traceability
@@ -123,6 +125,10 @@ export async function processAgentResponse(
     sessionId: session.sessionDbId,
     memorySessionId: session.memorySessionId
   });
+
+  // Track whether a summary record was stored so the status endpoint can expose this
+  // to the Stop hook for silent-summary-loss detection (#1633)
+  session.lastSummaryStored = result.summaryId !== null;
 
   // CLAIM-CONFIRM: Now that storage succeeded, confirm all processing messages (delete from queue)
   // This is the critical step that prevents message loss on generator crash
@@ -236,6 +242,7 @@ async function syncAndBroadcastObservations(
       id: obsId,
       memory_session_id: session.memorySessionId,
       session_id: session.contentSessionId,
+      platform_source: session.platformSource,
       type: obs.type,
       title: obs.title,
       subtitle: obs.subtitle,
@@ -325,12 +332,13 @@ async function syncAndBroadcastSummary(
   broadcastSummary(worker, {
     id: result.summaryId,
     session_id: session.contentSessionId,
-    request: summary!.request,
-    investigated: summary!.investigated,
-    learned: summary!.learned,
-    completed: summary!.completed,
-    next_steps: summary!.next_steps,
-    notes: summary!.notes,
+    platform_source: session.platformSource,
+    request: summaryForStore!.request,
+    investigated: summaryForStore!.investigated,
+    learned: summaryForStore!.learned,
+    completed: summaryForStore!.completed,
+    next_steps: summaryForStore!.next_steps,
+    notes: summaryForStore!.notes,
     project: session.project,
     prompt_number: session.lastPromptNumber,
     created_at_epoch: result.createdAtEpoch

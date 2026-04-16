@@ -4,10 +4,284 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [11.0.1] - 2026-
-✅ CHANGELOG.md generated successfully!
-   222 releases processed
-fault from `true` to `false`.
+## [12.1.5] - 2026-04-15
+
+## Forced update to ship --setting-sources fix
+
+Users on v12.1.3 experience 100% observation failure due to empty-string arg filtering corrupting `--setting-sources` on Claude Code 2.1.109+. The fix landed in v12.1.4 (commit 3d92684 — `fix: filter empty string args before Bun spawn()`). This release forces the update to propagate across npm and the marketplace.
+
+Also shipped earlier today: the April 2026 backlog consolidation merged 93 PRs and 147 issues into 138 clean tracking issues (95 bugs, 43 feature requests).
+
+**Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v12.1.4...v12.1.5
+
+## [12.1.4] - 2026-04-15
+
+A Claude instance inserted `$CMEM` token branding into the context injection header during a compression refactor. Reverted back to the original descriptive format: `# [project] recent context, datetime`
+
+**Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v12.1.3...v12.1.4
+
+## [12.1.3] - 2026-04-15
+
+## What's Changed
+
+### Reverted
+- **Remove overengineered summary salvage logic** (#1850) — Reverts PR #1718 which fabricated synthetic summaries from observation data when the AI returned `<observation>` instead of `<summary>` tags. Missing a summary is preferable to creating a fake one with poorly-mapped fields.
+
+**Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v12.1.2...v12.1.3
+
+## [12.1.2] - 2026-04-15
+
+## Community PRs merged (15)
+
+**Runtime & reliability**
+- #1698 Reap stuck generators in reapStaleSessions (@ousamabenyounes)
+- #1697 Circuit breaker on OpenClaw worker client (@ousamabenyounes)
+- #1696 Resolve Setup hook reference, warn on macOS-only binary (@ousamabenyounes)
+- #1693 Session lifecycle guards to prevent runaway API spend (@ousamabenyounes)
+- #1692 Resolve Gemini CLI 0.37.0 session capture failures (@ousamabenyounes)
+
+**Cross-platform & hooks**
+- #1833 Replace hardcoded nvm/homebrew PATH with login-shell resolution (@masak1yu)
+- #1781 Filter empty-string args before Bun spawn() (@biswanath-cmd)
+- #1780 Fix npx search, default Codex context to workspace-local AGENTS (@enma998)
+
+**Data integrity**
+- #1820 Use parent project name for worktree observation writes (@0xLeathery)
+- #1771 Exclude primary-key index from unique-constraint check in migration 7 (@derjochenmeyer)
+- #1770 Restrict ~/.claude-mem/.env permissions to 0600 (@derjochenmeyer)
+- #1729 Preserve targeted file reads and invalidate on mtime (@quangtran88)
+- #1776 Coerce corpus route filters (@suyua9)
+
+**Docs**
+- #1777 Document CLAUDE_MEM_MODE (@AviArora02-commits)
+- #1765 Update opencode install instructions (@s-uryansh)
+
+## Held for rebase
+- #1748, #1694, #1695 — developed conflicts during batch merge
+
+## Test baseline
+1429 pass / 11 fail (improved from 18 fail at v12.1.1)
+
+## [12.1.1] - 2026-04-15
+
+14 community PRs merged + 1 post-merge bug fix. This patch addresses the most impactful bugs across summary persistence, MCP compliance, cross-platform compatibility, and data integrity.
+
+### Highlights
+
+**Summary pipeline fix** — When the LLM returns `<observation>` tags instead of `<summary>` tags (~72% of the time on v12.0.x), data is now salvaged into a synthetic summary instead of being silently discarded. (#1718)
+
+**MCP compliance** — `list_corpora` now returns proper `CallToolResult` objects instead of bare arrays that crashed MCP clients. Search and timeline tools now declare `inputSchema.properties`. (#1701, #1555)
+
+**Data integrity** — Ghost observations with no content fields are now filtered before storage. Search queries are now scoped to the current project via `WHERE project = ?`. (#1676, #1688... wait, #1688 wasn't in this batch)
+
+### Bug Fixes
+
+- **fix(ResponseProcessor):** salvage synthetic summary when AI returns `<observation>` instead of `<summary>` (#1718)
+- **fix(ResponseProcessor):** broadcast uses `summaryForStore` to support salvaged summaries (post-merge fix for #1718)
+- **fix(hooks):** soft-fail SessionStart health check on cold start (#1725)
+- **fix(deps):** upgrade glob ^11.0.3 → ^13.0.0 for CVE fix (#1724, #1717)
+- **fix(MCP):** wrap `list_corpora` response in CallToolResult shape (#1701, #1700)
+- **fix(MCP):** declare inputSchema properties for search and timeline tools (#1555, #1384, #1413)
+- **fix(config):** use bun to run mcp-server.cjs instead of node shebang (#1658, #1648)
+- **fix(parser):** filter ghost observations with no content fields (#1676, #1625)
+- **fix(chroma):** set cwd to homedir when spawning chroma-mcp to prevent .env.local crash (#1679, #1297)
+- **fix(Windows):** avoid DEP0190 deprecation by using single-string spawnSync (#1677, #1503)
+- **fix(worker):** suppress false ERROR when duplicate daemon loses port bind race (#1680, #1447)
+- **fix(session):** expose `summaryStored` in session status for silent summary loss detection (#1686, #1633)
+- **fix(cross-platform):** add .gitattributes to enforce LF endings on plugin scripts (#1678, #1342)
+- **fix(tests):** remove leaky mock.module() that polluted parallel workers (#1666, #1299)
+
+### Docs
+
+- Add Language Support section to smart-explore/SKILL.md (#1670, #1651)
+- Remove misplaced tree-sitter docs from mem-search/SKILL.md
+
+### Contributors
+
+@ousamabenyounes (10 PRs), @aaronwong1989, @kbroughton, @joao-oliveira-softtor, @octo-patch, @ck0park
+
+## [12.1.0] - 2026-04-09
+
+## Knowledge Agents
+
+Build queryable AI "brains" from your claude-mem observation history. Compile a filtered slice of your past work into a corpus, prime it into a Claude session, and ask questions conversationally — getting synthesized, grounded answers instead of raw search results.
+
+### New Features
+
+- **Knowledge Agent system** — full lifecycle: build, prime, query, reprime, rebuild, delete
+- **6 new MCP tools**: `build_corpus`, `list_corpora`, `prime_corpus`, `query_corpus`, `rebuild_corpus`, `reprime_corpus`
+- **8 new HTTP API endpoints** on the worker service (`/api/corpus/*`)
+- **CorpusBuilder** — searches observations, hydrates full records, calculates stats, persists to `~/.claude-mem/corpora/`
+- **CorpusRenderer** — renders observations into full-detail prompt text for the 1M token context window
+- **KnowledgeAgent** — manages Agent SDK sessions with session resume for multi-turn Q&A
+- **Auto-reprime** — expired sessions are automatically reprimed and retried (only for session errors, not all failures)
+- **Knowledge agent skill** (`/knowledge-agent`) for guided corpus creation
+
+### Security & Robustness
+
+- Path traversal prevention in CorpusStore (alphanumeric name validation + resolved path check)
+- System prompt hardened against instruction injection from untrusted corpus content
+- Runtime name validation on all MCP corpus tool handlers
+- Question field validated as non-empty string
+- Session state only persisted after successful prime (not null on failure)
+- Refreshed session_id persisted after query execution
+- E2e curl wrappers hardened with connect-timeout and transport failure fallback
+
+### Documentation
+
+- New docs page: Knowledge Agents usage guide with Quick Start, architecture diagram, filter reference, and API reference
+- Knowledge agent skill page with workflow examples
+- Added to docs navigation
+
+### Testing
+
+- Comprehensive e2e test suite (31 tests) covering full corpus lifecycle
+
+**Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v12.0.1...v12.1.0
+
+## [12.0.1] - 2026-04-08
+
+## 🔴 Hotfix: MCP server crashed with `Cannot find module 'bun:sqlite'` under Node
+
+v12.0.0 shipped a broken MCP server bundle that crashed on the very first `require()` call because a transitive import pulled `bun:sqlite` (a Bun-only module) into a bundle that runs under Node. Every MCP-only client (Codex and any flow that boots the MCP tool surface) was completely broken on v12.0.0.
+
+### Root cause
+
+`src/servers/mcp-server.ts` imported `ensureWorkerStarted` from `worker-service.ts`, which transitively pulled in `DatabaseManager` → `bun:sqlite`. The bundle ballooned from ~358KB (v11.0.1) to ~1.96MB (v12.0.0) and `node mcp-server.cjs` immediately threw `Error: Cannot find module 'bun:sqlite'`.
+
+### Fix
+
+- **Extracted** `ensureWorkerStarted` and Windows spawn-cooldown helpers into a new lightweight `src/services/worker-spawner.ts` module that has zero database/SQLite/ChromaDB imports
+- **Wired** `mcp-server.ts` and `worker-service.ts` through the new module via a thin back-compat wrapper
+- **Fixed** `resolveWorkerRuntimePath()` to find Bun on every platform (not just Windows) so the MCP server running under Node can correctly spawn the worker daemon under Bun
+- **Added** two build-time guardrails in `scripts/build-hooks.js`:
+  - Regex check: fails the build if `mcp-server.cjs` ever contains a `require("bun:*")` call
+  - Bundle size budget: fails the build if `mcp-server.cjs` exceeds 600KB
+- **Improved** error messages when Bun cannot be located (now names the install URL and explains *why* Bun is required)
+- **Validated** `workerScriptPath` at the spawner entry point with empty-string and existsSync guards
+- **Memoized** `resolveWorkerRuntimePath()` to skip repeated PATH lookups during crash loops, while never caching the not-found result so a long-running MCP server can recover if Bun is installed mid-session
+
+### Verification
+
+- `node mcp-server.cjs` exits cleanly under Node
+- JSON-RPC `initialize` + `tools/list` + `tools/call search` all succeed end-to-end
+- Bundle is back to ~384KB with zero `require("bun:sqlite")` calls
+- 47 unit tests pass (44 ProcessManager + 3 worker-spawner)
+- Both build guardrails verified to trip on simulated regressions
+- Smoke test: MCP server serves the full 7-tool surface
+
+### What this means for users
+
+- **MCP-only clients (Codex, etc.):** v12.0.0 was broken; v12.0.1 restores full functionality
+- **Claude Code users:** worker startup via the SessionStart hook continued working under Bun on v12.0.0, but the MCP tool surface (`mem-search`, `timeline`, `get_observations`, `smart_*`) was unreliable. v12.0.1 fixes that completely.
+- **Plugin developers:** new build-time guardrails prevent this regression class from shipping again
+
+PR: #1645
+Merge commit: `abd55977`
+
+## [12.0.0] - 2026-04-07
+
+# claude-mem v12.0.0
+
+A major release delivering intelligent file-read gating, expanded language support for smart-explore, platform source isolation, and 40+ bug fixes across Windows, Linux, and macOS.
+
+## Highlights
+
+### File-Read Decision Gate
+Claude Code now intelligently gates redundant file reads. When a file has prior observations in the timeline, the PreToolUse hook injects the observation history and blocks the read — saving tokens and keeping context focused. The gate supports both `Read` and `Edit` tools, uses `permissionDecision` deny with a rich timeline payload, and includes file-size thresholds and observation deduplication.
+
+### Smart-Explore: 24 Language Support
+The `smart-explore` skill now supports **24 programming languages** via tree-sitter AST parsing: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, CSS, SCSS, HTML, Lua, Haskell, Elixir, Zig, TOML, and YAML. User-installable grammars with `--legacy-peer-deps` support for tree-sitter version conflicts.
+
+### Platform Source Isolation
+Claude and Codex sessions are now fully isolated with `platform_source` column on `sdk_sessions`. Each platform gets its own session namespace, preventing cross-contamination between different AI coding tools. Normalized at route boundaries for consistent behavior.
+
+### Codex & OpenClaw Support
+- Codex plugin manifest added for marketplace discoverability
+- OpenClaw: `workerHost` config for Docker deployments
+- OpenClaw: handle stale `plugins.allow` and non-interactive TTY in installer
+
+## New Features
+
+- **File-read decision gate** — blocks redundant file reads with observation timeline injection (#1564, #1629, #1641)
+- **24-language smart-explore** — AST-based code exploration across all major languages
+- **Platform source isolation** — Claude/Codex session namespacing with DB migration
+- **CLAUDE.local.md support** — `CLAUDE_MEM_FOLDER_USE_LOCAL_MD` setting for writing to local-only config
+- **OpenClaw workerHost** — Docker deployment support for OpenClaw plugin
+- **Codex plugin manifest** — discoverability in Codex marketplace
+- **File-size threshold** — skip file-read gating for small files
+- **Observation deduplication** — prevent duplicate observations in timeline gate
+
+## Bug Fixes
+
+### Worker & Startup
+- Fix worker startup crash with missing observation columns (#1641)
+- Fix SessionStart hooks failing on cold start due to worker race condition
+- Fix worker daemon being killed by its own hooks (#1490)
+- Fail worker-start hook if worker never becomes healthy
+- Fix readiness timeout logging on reused-worker path (#1491)
+- Remove dead `USER_MESSAGE_ONLY` exit code that caused SessionStart hook errors
+- Decouple MCP health from loopback self-check
+
+### Data Integrity
+- Fix migration version conflict: `addSessionPlatformSourceColumn` now correctly uses v25
+- Add migration for `generated_by_model` and `relevance_count` columns
+- Wire `generated_by_model` into observation write path
+- Use null-byte delimiter in observation content hash to prevent collisions
+- Persist session completion to database in `completeByDbId` (#1532)
+- Handle bare path strings in `files_modified`/`files_read` columns (#1359)
+- Guard `json_each()` calls against legacy bare-path rows
+- Deduplicate session init to prevent multiple prompt records
+
+### Security
+- Prevent shell injection in summary workflow (#1285)
+- Sanitize observation titles in file-context deny reason (strip newlines, collapse whitespace)
+- Normalize `platformSource` at route boundary to prevent filter inconsistencies
+- Escape `filePath` in recovery hints to prevent malformed output
+- Address path safety, SQL injection, and gate scoping in file-read hook
+
+### Windows
+- Fix `isMainModule` CJS branch failure on Bun — add `CLAUDE_MEM_MANAGED` fallback
+- Use `cmd /c` to execute `bun.cmd` on Windows
+- Prefer `bun.cmd` over bun shell script on Windows
+- Add `shell: true` on Windows to spawn bun from npm
+
+### Cross-Platform
+- Replace GNU `sort -V` with POSIX-portable version sort
+- Resolve `node not found` on nvm/homebrew installations
+- Resolve hook failures when `CLAUDE_PLUGIN_ROOT` is not injected (#1533)
+- Fix bun-runner signal exit handling — scope to `start` subcommand only
+- Guard `/stream` SSE endpoint with 503 before DB initialization
+- Provide empty JSON fallback when stdin is not piped (#1560)
+
+### Parser & Content
+- Strip `<persisted-output>` tags from memory
+- Strip `<system-reminder>` tags from persisted memory and DRY up regex
+- Skip `parseSummary` false positives with no sub-tags (#1360)
+- Handle bare filenames in `regenerate-claude-md.ts` (#1514)
+- Handle bare filenames in `path-utils.ts isDirectChild`
+- Handle single-quoted paths and dangling var edge case
+- Strip hardcoded `__dirname`/`__filename` from bundled CJS output
+- Add PHP grammar support to smart-file-read parser (#1617)
+
+### Installer & Config
+- Make post-install allowlist write guaranteed
+- Harden plugin manifest sync script
+- Fix `expand ~` to home directory before project resolution
+- Update default model from `claude-sonnet-4-5` to `claude-sonnet-4-6` (#1390)
+- Fix Gemini conversation history truncation to prevent O(N²) token cost growth
+
+## Refactoring
+
+- Rename formatters to `AgentFormatter`/`HumanFormatter` for semantic clarity
+
+---
+
+**Full Changelog**: https://github.com/thedotmack/claude-mem/compare/v11.0.1...v12.0.0
+
+## [11.0.1] - 2026-04-06
+
+**Patch release** — Changes `CLAUDE_MEM_SEMANTIC_INJECT` default from `true` to `false`.
 
 ### What changed
 - Per-prompt Chroma vector search on `UserPromptSubmit` is now **opt-in** rather than opt-out

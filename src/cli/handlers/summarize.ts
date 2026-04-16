@@ -18,6 +18,7 @@ import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-util
 import { logger } from '../../utils/logger.js';
 import { extractLastMessage } from '../../shared/transcript-parser.js';
 import { HOOK_EXIT_CODES, HOOK_TIMEOUTS, getTimeout } from '../../shared/hook-constants.js';
+import { normalizePlatformSource } from '../../shared/platform-source.js';
 
 const SUMMARIZE_TIMEOUT_MS = getTimeout(HOOK_TIMEOUTS.DEFAULT);
 const POLL_INTERVAL_MS = 500;
@@ -66,13 +67,16 @@ export const summarizeHandler: EventHandler = {
       hasLastAssistantMessage: !!lastAssistantMessage
     });
 
+    const platformSource = normalizePlatformSource(input.platform);
+
     // 1. Queue summarize request — worker returns immediately with { status: 'queued' }
     const response = await workerHttpRequest('/api/sessions/summarize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contentSessionId: sessionId,
-        last_assistant_message: lastAssistantMessage
+        last_assistant_message: lastAssistantMessage,
+        platformSource
       }),
       timeoutMs: SUMMARIZE_TIMEOUT_MS
     });
@@ -87,20 +91,32 @@ export const summarizeHandler: EventHandler = {
     //    This keeps the Stop hook alive (120s timeout) so the SDK agent
     //    can finish processing the summary before SessionEnd kills the session.
     const waitStart = Date.now();
+    let summaryStored: boolean | null = null;
     while ((Date.now() - waitStart) < MAX_WAIT_FOR_SUMMARY_MS) {
       await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
       try {
         const statusResponse = await workerHttpRequest(`/api/sessions/status?contentSessionId=${encodeURIComponent(sessionId)}`, {
           timeoutMs: 5000
         });
-        if (statusResponse.ok) {
-          const status = await statusResponse.json() as { queueLength?: number };
-          if ((status.queueLength ?? 0) === 0) {
-            logger.info('HOOK', 'Summary processing complete', {
+        const status = await statusResponse.json() as { queueLength?: number; summaryStored?: boolean | null };
+        const queueLength = status.queueLength ?? 0;
+        // Only treat an empty queue as completion when the session exists (non-404).
+        // A 404 means the session was not found — not that processing finished.
+        if (queueLength === 0 && statusResponse.status !== 404) {
+          summaryStored = status.summaryStored ?? null;
+          logger.info('HOOK', 'Summary processing complete', {
+            waitedMs: Date.now() - waitStart,
+            summaryStored
+          });
+          // Warn when the agent processed a summarize request but produced no storable summary.
+          // This is the silent-failure path described in #1633: queue empties but no summary record exists.
+          if (summaryStored === false) {
+            logger.warn('HOOK', 'Summary was not stored: LLM response likely lacked valid <summary> tags (#1633)', {
+              sessionId,
               waitedMs: Date.now() - waitStart
             });
-            break;
           }
+          break;
         }
       } catch {
         // Worker may be busy — keep polling
