@@ -1,24 +1,29 @@
+export type FeedItemId = number | string;
+
 export interface Observation {
-  id: number;
+  id: FeedItemId;
   memory_session_id: string;
+  content_session_id: string;
   project: string;
+  merged_into_project?: string | null;
   platform_source: string;
   type: string;
   title: string | null;
   subtitle: string | null;
   narrative: string | null;
   text: string | null;
-  facts: string | null;
-  concepts: string | null;
-  files_read: string | null;
-  files_modified: string | null;
+  facts: string | string[] | null;
+  concepts: string | string[] | null;
+  files_read: string | string[] | null;
+  files_modified: string | string[] | null;
   prompt_number: number | null;
   created_at: string;
   created_at_epoch: number;
 }
 
 export interface Summary {
-  id: number;
+  id: FeedItemId;
+  content_session_id?: string;
   session_id: string;
   project: string;
   platform_source: string;
@@ -27,11 +32,12 @@ export interface Summary {
   learned?: string;
   completed?: string;
   next_steps?: string;
+  notes?: string | null;
   created_at_epoch: number;
 }
 
 export interface UserPrompt {
-  id: number;
+  id: FeedItemId;
   content_session_id: string;
   project: string;
   platform_source: string;
@@ -40,24 +46,38 @@ export interface UserPrompt {
   created_at_epoch: number;
 }
 
+export interface SessionCatalogEntry {
+  content_session_id: string;
+  project: string;
+  platform_source: string;
+  custom_title: string | null;
+  started_at_epoch: number;
+  item_count: number;
+}
+
 export type FeedItem =
   | (Observation & { itemType: 'observation' })
   | (Summary & { itemType: 'summary' })
   | (UserPrompt & { itemType: 'prompt' });
 
+export type FeedItemType = 'observation' | 'summary' | 'prompt';
+
 export interface StreamEvent {
-  type: 'initial_load' | 'new_observation' | 'new_summary' | 'new_prompt' | 'processing_status';
+  type: 'initial_load' | 'new_observation' | 'new_summary' | 'new_prompt' | 'processing_status' | 'item_deleted' | 'session_deleted';
   observations?: Observation[];
   summaries?: Summary[];
   prompts?: UserPrompt[];
   projects?: string[];
-  sources?: string[];
-  projectsBySource?: Record<string, string[]>;
   observation?: Observation;
   summary?: Summary;
   prompt?: UserPrompt;
   isProcessing?: boolean;
   queueDepth?: number;
+  itemType?: FeedItemType;
+  id?: FeedItemId;
+  /** session_deleted */
+  platformSource?: string;
+  contentSessionId?: string;
 }
 
 export interface ProjectCatalog {
@@ -67,52 +87,49 @@ export interface ProjectCatalog {
 }
 
 export interface Settings {
+  CLAUDE_MEM_BACKEND?: 'java';
   CLAUDE_MEM_MODEL: string;
   CLAUDE_MEM_CONTEXT_OBSERVATIONS: string;
+  CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES?: string;
   CLAUDE_MEM_WORKER_PORT: string;
   CLAUDE_MEM_WORKER_HOST: string;
 
-  // AI Provider Configuration
-  CLAUDE_MEM_PROVIDER?: string;  // 'claude' | 'gemini' | 'openrouter'
+  CLAUDE_MEM_PROVIDER?: string;  
+  CLAUDE_MEM_CODEX_MODEL?: string;
   CLAUDE_MEM_GEMINI_API_KEY?: string;
-  CLAUDE_MEM_GEMINI_MODEL?: string;  // 'gemini-2.5-flash-lite' | 'gemini-2.5-flash' | 'gemini-3-flash-preview'
-  CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED?: string;  // 'true' | 'false'
+  CLAUDE_MEM_GEMINI_API_KEYS?: string;
+  CLAUDE_MEM_GEMINI_MODEL?: string;  
+  CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED?: string;  
   CLAUDE_MEM_OPENROUTER_API_KEY?: string;
+  CLAUDE_MEM_OPENROUTER_API_KEYS?: string;
+  CLAUDE_MEM_OPENROUTER_BASE_URL?: string;
   CLAUDE_MEM_OPENROUTER_MODEL?: string;
   CLAUDE_MEM_OPENROUTER_SITE_URL?: string;
   CLAUDE_MEM_OPENROUTER_APP_NAME?: string;
+  CLAUDE_MEM_OPENROUTER_REASONING_EFFORT?: string;
+  CLAUDE_MEM_OPENAI_COMPAT_PRESET?: string;
+  CLAUDE_MEM_OPENAI_COMPAT_API_KEY?: string;
+  CLAUDE_MEM_OPENAI_COMPAT_API_KEYS?: string;
+  CLAUDE_MEM_OPENAI_COMPAT_BASE_URL?: string;
+  CLAUDE_MEM_OPENAI_COMPAT_MODEL?: string;
+  CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER?: string;
+  CLAUDE_MEM_QUOTA_FALLBACK_MODEL?: string;
 
-  // Token Economics Display
   CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS?: string;
   CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS?: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT?: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT?: string;
 
-  // Display Configuration
   CLAUDE_MEM_CONTEXT_FULL_COUNT?: string;
+  CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES?: string;
+  CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS?: string;
   CLAUDE_MEM_CONTEXT_FULL_FIELD?: string;
   CLAUDE_MEM_CONTEXT_SESSION_COUNT?: string;
 
-  // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY?: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE?: string;
-}
+  CLAUDE_MEM_FILE_READ_GATE_ENABLED?: string;
 
-export interface WorkerStats {
-  version?: string;
-  uptime?: number;
-  activeSessions?: number;
-  sseClients?: number;
-}
-
-export interface DatabaseStats {
-  size?: number;
-  observations?: number;
-  sessions?: number;
-  summaries?: number;
-}
-
-export interface Stats {
-  worker?: WorkerStats;
-  database?: DatabaseStats;
+  /** File/env only — shown read-only. Not written via POST /api/settings. */
+  CLAUDE_CODE_PATH?: string;
 }

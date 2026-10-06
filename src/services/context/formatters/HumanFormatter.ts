@@ -1,8 +1,3 @@
-/**
- * HumanFormatter - Formats context output with ANSI colors for terminal
- *
- * Handles all colored formatting for context injection (terminal display).
- */
 
 import type {
   ContextConfig,
@@ -13,37 +8,25 @@ import type {
 import { colors } from '../types.js';
 import { ModeManager } from '../../domain/ModeManager.js';
 import { formatObservationTokenDisplay } from '../TokenCalculator.js';
+import { formatHeaderDateTime } from '../../../shared/timeline-formatting.js';
+import { formatContextReferenceId } from './id-display.js';
 
-/**
- * Format current date/time for header display
- */
-function formatHeaderDateTime(): string {
-  const now = new Date();
-  const date = now.toLocaleDateString('en-CA'); // YYYY-MM-DD format
-  const time = now.toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  }).toLowerCase().replace(' ', '');
-  const tz = now.toLocaleTimeString('en-US', { timeZoneName: 'short' }).split(' ').pop();
-  return `${date} ${time} ${tz}`;
+function formatActiveMode(): string {
+  const manager = ModeManager.getInstance();
+  const mode = manager.getActiveMode();
+  return `${mode.name} (${manager.getActiveModeId()})`;
 }
 
-/**
- * Render human-readable header
- */
-export function renderHumanHeader(project: string): string[] {
+export function renderHumanHeader(project: string, headerTime: string = formatHeaderDateTime()): string[] {
   return [
     '',
-    `${colors.bright}${colors.cyan}[${project}] recent context, ${formatHeaderDateTime()}${colors.reset}`,
+    `${colors.bright}${colors.cyan}[${project}] recent context, ${headerTime}${colors.reset}`,
+    `${colors.dim}Mode: ${formatActiveMode()}${colors.reset}`,
     `${colors.gray}${'─'.repeat(60)}${colors.reset}`,
     ''
   ];
 }
 
-/**
- * Render human-readable legend
- */
 export function renderHumanLegend(): string[] {
   const mode = ModeManager.getInstance().getActiveMode();
   const typeLegendItems = mode.observation_types.map(t => `${t.emoji} ${t.id}`).join(' | ');
@@ -54,9 +37,6 @@ export function renderHumanLegend(): string[] {
   ];
 }
 
-/**
- * Render human-readable column key
- */
 export function renderHumanColumnKey(): string[] {
   return [
     `${colors.bright}Column Key${colors.reset}`,
@@ -66,24 +46,28 @@ export function renderHumanColumnKey(): string[] {
   ];
 }
 
-/**
- * Render human-readable context index instructions
- */
-export function renderHumanContextIndex(): string[] {
+export function renderHumanContextIndex(fetchByIdSupported: boolean = true): string[] {
+  // Server runtime: ids are UUIDs shown as 8-char display refs, and neither
+  // get_observations nor the mem-search skill's worker tools exist there; the
+  // server's own search tool covers both drill-down and history.
+  const drilldownLines = fetchByIdSupported
+    ? [
+        `${colors.dim}  - Fetch by ID: get_observations([IDs]) for observations visible in this index${colors.reset}`,
+        `${colors.dim}  - Search history: Use the mem-search skill for past decisions, bugs, and deeper research${colors.reset}`,
+      ]
+    : [
+        `${colors.dim}  - Search: observation_search by title or topic (short refs are display-only; server runtime has no fetch by ID)${colors.reset}`,
+      ];
   return [
     `${colors.dim}Context Index: This semantic index (titles, types, files, tokens) is usually sufficient to understand past work.${colors.reset}`,
     '',
     `${colors.dim}When you need implementation details, rationale, or debugging context:${colors.reset}`,
-    `${colors.dim}  - Fetch by ID: get_observations([IDs]) for observations visible in this index${colors.reset}`,
-    `${colors.dim}  - Search history: Use the mem-search skill for past decisions, bugs, and deeper research${colors.reset}`,
+    ...drilldownLines,
     `${colors.dim}  - Trust this index over re-reading code for past decisions and learnings${colors.reset}`,
     ''
   ];
 }
 
-/**
- * Render human-readable context economics
- */
 export function renderHumanContextEconomics(
   economics: TokenEconomics,
   config: ContextConfig
@@ -110,9 +94,6 @@ export function renderHumanContextEconomics(
   return output;
 }
 
-/**
- * Render human-readable day header
- */
 export function renderHumanDayHeader(day: string): string[] {
   return [
     `${colors.bright}${colors.cyan}${day}${colors.reset}`,
@@ -120,18 +101,12 @@ export function renderHumanDayHeader(day: string): string[] {
   ];
 }
 
-/**
- * Render human-readable file header
- */
 export function renderHumanFileHeader(file: string): string[] {
   return [
     `${colors.dim}${file}${colors.reset}`
   ];
 }
 
-/**
- * Render human-readable table row for observation
- */
 export function renderHumanTableRow(
   obs: Observation,
   time: string,
@@ -146,12 +121,9 @@ export function renderHumanTableRow(
   const readPart = (config.showReadTokens && readTokens > 0) ? `${colors.dim}(~${readTokens}t)${colors.reset}` : '';
   const discoveryPart = (config.showWorkTokens && discoveryTokens > 0) ? `${colors.dim}(${workEmoji} ${discoveryTokens.toLocaleString()}t)${colors.reset}` : '';
 
-  return `  ${colors.dim}#${obs.id}${colors.reset}  ${timePart}  ${icon}  ${title} ${readPart} ${discoveryPart}`;
+  return `  ${colors.dim}#${formatContextReferenceId(obs.id, config)}${colors.reset}  ${timePart}  ${icon}  ${title} ${readPart} ${discoveryPart}`;
 }
 
-/**
- * Render human-readable full observation
- */
 export function renderHumanFullObservation(
   obs: Observation,
   time: string,
@@ -168,7 +140,7 @@ export function renderHumanFullObservation(
   const readPart = (config.showReadTokens && readTokens > 0) ? `${colors.dim}(~${readTokens}t)${colors.reset}` : '';
   const discoveryPart = (config.showWorkTokens && discoveryTokens > 0) ? `${colors.dim}(${workEmoji} ${discoveryTokens.toLocaleString()}t)${colors.reset}` : '';
 
-  output.push(`  ${colors.dim}#${obs.id}${colors.reset}  ${timePart}  ${icon}  ${colors.bright}${title}${colors.reset}`);
+  output.push(`  ${colors.dim}#${formatContextReferenceId(obs.id, config)}${colors.reset}  ${timePart}  ${icon}  ${colors.bright}${title}${colors.reset}`);
   if (detailField) {
     output.push(`    ${colors.dim}${detailField}${colors.reset}`);
   }
@@ -180,31 +152,23 @@ export function renderHumanFullObservation(
   return output;
 }
 
-/**
- * Render human-readable summary item in timeline
- */
 export function renderHumanSummaryItem(
-  summary: { id: number; request: string | null },
-  formattedTime: string
+  summary: { id: number | string; request: string | null },
+  formattedTime: string,
+  config: Pick<ContextConfig, 'fetchByIdSupported'> = {}
 ): string[] {
   const summaryTitle = `${summary.request || 'Session started'} (${formattedTime})`;
   return [
-    `${colors.yellow}#S${summary.id}${colors.reset} ${summaryTitle}`,
+    `${colors.yellow}#S${formatContextReferenceId(summary.id, config)}${colors.reset} ${summaryTitle}`,
     ''
   ];
 }
 
-/**
- * Render human-readable summary field
- */
 export function renderHumanSummaryField(label: string, value: string | null, color: string): string[] {
   if (!value) return [];
   return [`${color}${label}:${colors.reset} ${value}`, ''];
 }
 
-/**
- * Render human-readable previously section
- */
 export function renderHumanPreviouslySection(priorMessages: PriorMessages): string[] {
   if (!priorMessages.assistantMessage) return [];
 
@@ -219,9 +183,6 @@ export function renderHumanPreviouslySection(priorMessages: PriorMessages): stri
   ];
 }
 
-/**
- * Render human-readable footer
- */
 export function renderHumanFooter(totalDiscoveryTokens: number, totalReadTokens: number): string[] {
   const workTokensK = Math.round(totalDiscoveryTokens / 1000);
   return [
@@ -230,9 +191,6 @@ export function renderHumanFooter(totalDiscoveryTokens: number, totalReadTokens:
   ];
 }
 
-/**
- * Render human-readable empty state
- */
-export function renderHumanEmptyState(project: string): string {
-  return `\n${colors.bright}${colors.cyan}[${project}] recent context, ${formatHeaderDateTime()}${colors.reset}\n${colors.gray}${'─'.repeat(60)}${colors.reset}\n\n${colors.dim}No previous sessions found for this project yet.${colors.reset}\n`;
+export function renderHumanEmptyState(project: string, headerTime: string = formatHeaderDateTime()): string {
+  return `\n${colors.bright}${colors.cyan}[${project}] recent context, ${headerTime}${colors.reset}\n${colors.dim}Mode: ${formatActiveMode()}${colors.reset}\n${colors.gray}${'─'.repeat(60)}${colors.reset}\n\n${colors.dim}No previous sessions found for this project yet.${colors.reset}\n`;
 }

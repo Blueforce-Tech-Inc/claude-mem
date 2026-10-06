@@ -1,44 +1,63 @@
-/**
- * KnowledgeAgent - Manages Agent SDK sessions for knowledge corpora
- *
- * Uses the V1 Agent SDK query() API to:
- * 1. Prime a session with a full corpus (all observations loaded into context)
- * 2. Query the primed session with follow-up questions (via session resume)
- * 3. Reprime to create a fresh session (clears accumulated Q&A context)
- *
- * Knowledge agents are Q&A only - all 12 tools are blocked.
- */
 
-import { execSync } from 'child_process';
 import { CorpusStore } from './CorpusStore.js';
 import { CorpusRenderer } from './CorpusRenderer.js';
 import type { CorpusFile, QueryResult } from './types.js';
 import { logger } from '../../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH, OBSERVER_SESSIONS_DIR, ensureDir } from '../../../shared/paths.js';
-import { buildIsolatedEnv } from '../../../shared/EnvManager.js';
+import { USER_SETTINGS_PATH } from '../../../shared/paths.js';
+import { buildIsolatedEnvWithFreshOAuth } from '../../../shared/EnvManager.js';
+import { findClaudeExecutable } from '../../../shared/find-claude-executable.js';
 import { sanitizeEnv } from '../../../supervisor/env-sanitizer.js';
+import { resolveTierAlias } from '../model-aliases.js';
 
-// Import Agent SDK (V1 API — same pattern as SDKAgent.ts)
 // @ts-ignore - Agent SDK types may not be available
 import { query } from '@anthropic-ai/claude-agent-sdk';
+import { buildHardenedSdkOptions } from '../../../sdk/hardened-options.js';
 
-// Knowledge agent is Q&A only — all 12 tools blocked
-// Copied from SDKAgent.ts:55-67
-const KNOWLEDGE_AGENT_DISALLOWED_TOOLS = [
-  'Bash',           // Prevent infinite loops
-  'Read',           // No file reading
-  'Write',          // No file writing
-  'Edit',           // No file editing
-  'Grep',           // No code searching
-  'Glob',           // No file pattern matching
-  'WebFetch',       // No web fetching
-  'WebSearch',      // No web searching
-  'Task',           // No spawning sub-agents
-  'NotebookEdit',   // No notebook editing
-  'AskUserQuestion',// No asking questions
-  'TodoWrite'       // No todo management
-];
+/**
+ * The exact line the Claude Code CLI prints when `--resume <id>` names a
+ * session it has no transcript for. In stream-json mode it arrives first as the
+ * `errors` entry of an `error_during_execution` result, which
+ * `errorFromUnsuccessfulResult` keeps in its message; the Agent SDK can also
+ * repeat it inside `Claude Code process exited with code N. stderr: <tail>`
+ * (sdk.mjs `formatStderrTail`). The line itself lives in the CLI binary
+ * (@anthropic-ai/claude-agent-sdk-darwin-arm64/claude, SDK 0.3.289).
+ */
+const SDK_SESSION_RESUME_FAILURE_PATTERN = /No conversation found with session ID/;
+
+/**
+ * True only for the SDK's explicit "this session cannot be resumed" failure.
+ * Anything else (auth, network, a generic "not found", an abort) must surface
+ * as-is rather than silently paying for a fresh prime.
+ */
+export function isSessionResumeError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return SDK_SESSION_RESUME_FAILURE_PATTERN.test(message);
+}
+
+/**
+ * The error for a terminal SDK result that did not succeed, carrying the
+ * result's own text: `errors` on the error subtypes, `result` on an `is_error`
+ * success (an API error). The SDK builds its "Claude Code returned an error
+ * result" error the same way (sdk.mjs). Keeping that text is what lets
+ * `isSessionResumeError` see an expired session, so `query` still reprimes.
+ */
+function errorFromUnsuccessfulResult(
+  action: 'prime' | 'query',
+  resultMessage: { subtype?: string; result?: unknown; errors?: unknown }
+): Error {
+  const details = resultMessage.subtype === 'success'
+    ? (typeof resultMessage.result === 'string' ? resultMessage.result.trim() : '')
+    : (Array.isArray(resultMessage.errors)
+      ? resultMessage.errors.map((entry) => String(entry).trim()).filter(Boolean).join('; ')
+      : '');
+  return new Error(`Knowledge ${action} failed (${resultMessage.subtype})${details ? `: ${details}` : ''}`);
+}
+
+/** Per-call options. `abortController` is passed to the Agent SDK's `Options.abortController` (sdk.d.ts). */
+export interface KnowledgeAgentCallOptions {
+  abortController?: AbortController;
+}
 
 export class KnowledgeAgent {
   private renderer: CorpusRenderer;
@@ -49,13 +68,7 @@ export class KnowledgeAgent {
     this.renderer = new CorpusRenderer();
   }
 
-  /**
-   * Prime a knowledge agent session by sending the full corpus as context.
-   * Creates a new SDK session, feeds it all observations, and stores the session_id.
-   *
-   * @returns The session_id for future resume queries
-   */
-  async prime(corpus: CorpusFile): Promise<string> {
+  async prime(corpus: CorpusFile, callOptions: KnowledgeAgentCallOptions = {}): Promise<string> {
     const renderedCorpus = this.renderer.renderCorpus(corpus);
 
     const primePrompt = [
@@ -68,40 +81,51 @@ export class KnowledgeAgent {
       'Acknowledge what you\'ve received. Summarize the key themes and topics you can answer questions about.'
     ].join('\n');
 
-    ensureDir(OBSERVER_SESSIONS_DIR);
-    const claudePath = this.findClaudeExecutable();
-    const isolatedEnv = sanitizeEnv(buildIsolatedEnv());
+    const claudePath = findClaudeExecutable('WORKER');
+    const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
 
     const queryResult = query({
       prompt: primePrompt,
-      options: {
+      options: buildHardenedSdkOptions({
+        source: 'KnowledgeAgent',
+        project: corpus.name,
         model: this.getModelId(),
-        cwd: OBSERVER_SESSIONS_DIR,
-        disallowedTools: KNOWLEDGE_AGENT_DISALLOWED_TOOLS,
+        env: isolatedEnv,
         pathToClaudeCodeExecutable: claudePath,
-        env: isolatedEnv
-      }
+        abortController: callOptions.abortController,
+      }),
     });
 
     let sessionId: string | undefined;
+    let successfulResult = false;
     try {
       for await (const msg of queryResult) {
         if (msg.session_id) sessionId = msg.session_id;
         if (msg.type === 'result') {
+          successfulResult = msg.is_error !== true && msg.subtype === 'success';
+          if (!successfulResult) throw errorFromUnsuccessfulResult('prime', msg);
           logger.info('WORKER', `Knowledge agent primed for corpus "${corpus.name}"`);
         }
       }
     } catch (error) {
-      // The SDK may throw after yielding all messages when the Claude process
-      // exits with a non-zero code. If we already captured a session_id,
-      // treat this as success — the session was created and primed.
-      if (sessionId) {
-        logger.debug('WORKER', `SDK process exited after priming corpus "${corpus.name}" — session captured, continuing`, {}, error as Error);
+      if (callOptions.abortController?.signal.aborted) throw error;
+      if (sessionId && successfulResult) {
+        if (error instanceof Error) {
+          logger.debug('WORKER', `SDK process exited after priming corpus "${corpus.name}" — session captured, continuing`, {}, error);
+        } else {
+          logger.debug('WORKER', `SDK process exited after priming corpus "${corpus.name}" — session captured, continuing (non-Error thrown)`, { thrownValue: String(error) });
+        }
       } else {
         throw error;
       }
     }
 
+    // Never persist a session whose prime the caller abandoned, even if the SDK ended quietly.
+    callOptions.abortController?.signal.throwIfAborted();
+
+    if (!successfulResult) {
+      throw new Error(`Knowledge prime ended without a successful result for corpus "${corpus.name}"`);
+    }
     if (!sessionId) {
       throw new Error(`Failed to capture session_id while priming corpus "${corpus.name}"`);
     }
@@ -112,37 +136,36 @@ export class KnowledgeAgent {
     return sessionId;
   }
 
-  /**
-   * Query a primed knowledge agent by resuming its session.
-   * The agent answers from the corpus context loaded during prime().
-   *
-   * If the session has expired, auto-reprimes and retries the query.
-   */
-  async query(corpus: CorpusFile, question: string): Promise<QueryResult> {
+  async query(corpus: CorpusFile, question: string, callOptions: KnowledgeAgentCallOptions = {}): Promise<QueryResult> {
     if (!corpus.session_id) {
       throw new Error(`Corpus "${corpus.name}" has no session — call prime first`);
     }
 
     try {
-      const result = await this.executeQuery(corpus, question);
+      const result = await this.executeQuery(corpus, question, callOptions);
       if (result.session_id !== corpus.session_id) {
         corpus.session_id = result.session_id;
         this.corpusStore.write(corpus);
       }
       return result;
     } catch (error) {
-      if (!this.isSessionResumeError(error)) {
+      // The caller walked away; the route logs that once. Not a query failure.
+      if (callOptions.abortController?.signal.aborted) throw error;
+      if (!isSessionResumeError(error)) {
+        if (error instanceof Error) {
+          logger.error('WORKER', `Query failed for corpus "${corpus.name}"`, {}, error);
+        } else {
+          logger.error('WORKER', `Query failed for corpus "${corpus.name}" (non-Error thrown)`, { thrownValue: String(error) });
+        }
         throw error;
       }
-      // Session expired or invalid — auto-reprime and retry
       logger.info('WORKER', `Session expired for corpus "${corpus.name}", auto-repriming...`);
-      await this.prime(corpus);
-      // Re-read corpus to get the new session_id written by prime()
+      await this.prime(corpus, callOptions);
       const refreshedCorpus = this.corpusStore.read(corpus.name);
       if (!refreshedCorpus || !refreshedCorpus.session_id) {
         throw new Error(`Auto-reprime failed for corpus "${corpus.name}"`);
       }
-      const result = await this.executeQuery(refreshedCorpus, question);
+      const result = await this.executeQuery(refreshedCorpus, question, callOptions);
       if (result.session_id !== refreshedCorpus.session_id) {
         refreshedCorpus.session_id = result.session_id;
         this.corpusStore.write(refreshedCorpus);
@@ -151,50 +174,38 @@ export class KnowledgeAgent {
     }
   }
 
-  /**
-   * Reprime a corpus — creates a fresh session, clearing prior Q&A context.
-   *
-   * @returns The new session_id
-   */
-  async reprime(corpus: CorpusFile): Promise<string> {
-    corpus.session_id = null;  // Clear old session
-    return this.prime(corpus);
+  async reprime(corpus: CorpusFile, callOptions: KnowledgeAgentCallOptions = {}): Promise<string> {
+    corpus.session_id = null;
+    return this.prime(corpus, callOptions);
   }
 
-  /**
-   * Detect whether an error indicates an expired or invalid session resume.
-   * Only these errors trigger auto-reprime; all others are rethrown.
-   */
-  private isSessionResumeError(error: unknown): boolean {
-    const message = error instanceof Error ? error.message : String(error);
-    return /session|resume|expired|invalid.*session|not found/i.test(message);
-  }
-
-  /**
-   * Execute a single query against a primed session via V1 SDK resume.
-   */
-  private async executeQuery(corpus: CorpusFile, question: string): Promise<QueryResult> {
-    ensureDir(OBSERVER_SESSIONS_DIR);
-    const claudePath = this.findClaudeExecutable();
-    const isolatedEnv = sanitizeEnv(buildIsolatedEnv());
+  private async executeQuery(corpus: CorpusFile, question: string, callOptions: KnowledgeAgentCallOptions): Promise<QueryResult> {
+    const claudePath = findClaudeExecutable('WORKER');
+    const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
 
     const queryResult = query({
       prompt: question,
-      options: {
+      options: buildHardenedSdkOptions({
+        source: 'KnowledgeAgent',
+        project: corpus.name,
         model: this.getModelId(),
-        resume: corpus.session_id!,
-        cwd: OBSERVER_SESSIONS_DIR,
-        disallowedTools: KNOWLEDGE_AGENT_DISALLOWED_TOOLS,
+        env: isolatedEnv,
         pathToClaudeCodeExecutable: claudePath,
-        env: isolatedEnv
-      }
+        resume: corpus.session_id!,
+        abortController: callOptions.abortController,
+      }),
     });
 
     let answer = '';
     let newSessionId = corpus.session_id!;
+    let successfulResult = false;
     try {
       for await (const msg of queryResult) {
         if (msg.session_id) newSessionId = msg.session_id;
+        if (msg.type === 'result') {
+          successfulResult = msg.is_error !== true && msg.subtype === 'success';
+          if (!successfulResult) throw errorFromUnsuccessfulResult('query', msg);
+        }
         if (msg.type === 'assistant') {
           const text = msg.message.content
             .filter((b: any) => b.type === 'text')
@@ -204,64 +215,28 @@ export class KnowledgeAgent {
         }
       }
     } catch (error) {
-      // Same as prime() — SDK may throw after all messages are yielded.
-      // If we captured an answer, treat as success.
-      if (answer) {
-        logger.debug('WORKER', `SDK process exited after query — answer captured, continuing`, {}, error as Error);
+      if (callOptions.abortController?.signal.aborted) throw error;
+      if (answer && successfulResult) {
+        if (error instanceof Error) {
+          logger.debug('WORKER', `SDK process exited after query — answer captured, continuing`, {}, error);
+        } else {
+          logger.debug('WORKER', `SDK process exited after query — answer captured, continuing (non-Error thrown)`, { thrownValue: String(error) });
+        }
       } else {
         throw error;
       }
     }
 
+    if (!successfulResult) {
+      throw new Error(`Knowledge query ended without a successful result for corpus "${corpus.name}"`);
+    }
     return { answer, session_id: newSessionId };
   }
 
-  /**
-   * Get model ID from user settings — same as SDKAgent.getModelId()
-   */
   private getModelId(): string {
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    return settings.CLAUDE_MEM_MODEL;
+    // Resolve $TIER:<fast|smart|simple|summary> aliases at request time (#2289).
+    return resolveTierAlias(settings.CLAUDE_MEM_MODEL, settings);
   }
 
-  /**
-   * Find the Claude executable path.
-   * Mirrors SDKAgent.findClaudeExecutable() logic.
-   */
-  private findClaudeExecutable(): string {
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-
-    // 1. Check configured path
-    if (settings.CLAUDE_CODE_PATH) {
-      const { existsSync } = require('fs');
-      if (!existsSync(settings.CLAUDE_CODE_PATH)) {
-        throw new Error(`CLAUDE_CODE_PATH is set to "${settings.CLAUDE_CODE_PATH}" but the file does not exist.`);
-      }
-      return settings.CLAUDE_CODE_PATH;
-    }
-
-    // 2. On Windows, prefer "claude.cmd" via PATH
-    if (process.platform === 'win32') {
-      try {
-        execSync('where claude.cmd', { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-        return 'claude.cmd';
-      } catch {
-        // Fall through to generic detection
-      }
-    }
-
-    // 3. Auto-detection
-    try {
-      const claudePath = execSync(
-        process.platform === 'win32' ? 'where claude' : 'which claude',
-        { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] }
-      ).trim().split('\n')[0].trim();
-
-      if (claudePath) return claudePath;
-    } catch (error) {
-      logger.debug('WORKER', 'Claude executable auto-detection failed', {}, error as Error);
-    }
-
-    throw new Error('Claude executable not found. Please either:\n1. Add "claude" to your system PATH, or\n2. Set CLAUDE_CODE_PATH in ~/.claude-mem/settings.json');
-  }
 }

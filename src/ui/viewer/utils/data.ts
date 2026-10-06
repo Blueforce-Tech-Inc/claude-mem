@@ -1,26 +1,27 @@
-/**
- * Data manipulation utility functions
- * Used for merging and deduplicating real-time and paginated data
- */
+import { Observation, Summary, UserPrompt, FeedItem, FeedItemId } from '../types';
 
-/**
- * Merge real-time SSE items with paginated items, removing duplicates by ID
- * NOTE: This should ONLY be used when no project filter is active.
- * When filtering, use ONLY paginated data (API-filtered).
- *
- * @param liveItems - Items from SSE stream (unfiltered)
- * @param paginatedItems - Items from pagination API
- * @returns Merged and deduplicated array
- */
-export function mergeAndDeduplicateByProject<T extends { id: number; project?: string }>(
+export function mergeAndDeduplicateByProject<T extends { id: FeedItemId; project?: string }>(
   liveItems: T[],
   paginatedItems: T[]
 ): T[] {
-  // Deduplicate by ID
-  const seen = new Set<number>();
+  const seen = new Set<FeedItemId>();
   return [...liveItems, ...paginatedItems].filter(item => {
     if (seen.has(item.id)) return false;
     seen.add(item.id);
     return true;
   });
+}
+
+export function buildFeedItems(
+  observations: Observation[],
+  summaries: Summary[],
+  prompts: UserPrompt[]
+): FeedItem[] {
+  const combined: FeedItem[] = [
+    ...observations.map(o => ({ ...o, itemType: 'observation' as const })),
+    ...summaries.map(s => ({ ...s, itemType: 'summary' as const })),
+    ...prompts.map(p => ({ ...p, itemType: 'prompt' as const }))
+  ];
+
+  return combined.sort((a, b) => b.created_at_epoch - a.created_at_epoch);
 }

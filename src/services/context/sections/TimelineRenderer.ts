@@ -1,9 +1,3 @@
-/**
- * TimelineRenderer - Renders the chronological timeline of observations and summaries
- *
- * Handles day grouping and rendering. In agent (LLM) mode, uses flat compact lines.
- * In human (terminal) mode, uses file grouping with visual formatting.
- */
 
 import type {
   ContextConfig,
@@ -15,9 +9,6 @@ import { formatTime, formatDate, formatDateTime, extractFirstFile, parseJsonArra
 import * as Agent from '../formatters/AgentFormatter.js';
 import * as Human from '../formatters/HumanFormatter.js';
 
-/**
- * Group timeline items by day
- */
 export function groupTimelineByDay(timeline: TimelineItem[]): Map<string, TimelineItem[]> {
   const itemsByDay = new Map<string, TimelineItem[]>();
 
@@ -30,7 +21,6 @@ export function groupTimelineByDay(timeline: TimelineItem[]): Map<string, Timeli
     itemsByDay.get(day)!.push(item);
   }
 
-  // Sort days chronologically
   const sortedEntries = Array.from(itemsByDay.entries()).sort((a, b) => {
     const aDate = new Date(a[0]).getTime();
     const bDate = new Date(b[0]).getTime();
@@ -40,9 +30,6 @@ export function groupTimelineByDay(timeline: TimelineItem[]): Map<string, Timeli
   return new Map(sortedEntries);
 }
 
-/**
- * Get detail field content for full observation display
- */
 function getDetailField(obs: Observation, config: ContextConfig): string | null {
   if (config.fullObservationField === 'narrative') {
     return obs.narrative;
@@ -50,13 +37,10 @@ function getDetailField(obs: Observation, config: ContextConfig): string | null 
   return obs.facts ? parseJsonArray(obs.facts).join('\n') : null;
 }
 
-/**
- * Render a single day's timeline items (agent/LLM mode - flat compact lines)
- */
 function renderDayTimelineAgent(
   day: string,
   dayItems: TimelineItem[],
-  fullObservationIds: Set<number>,
+  fullObservationIds: Set<Observation['id']>,
   config: ContextConfig,
 ): string[] {
   const output: string[] = [];
@@ -69,7 +53,7 @@ function renderDayTimelineAgent(
     if (item.type === 'summary') {
       const summary = item.data as SummaryTimelineItem;
       const formattedTime = formatDateTime(summary.displayTime);
-      output.push(...Agent.renderAgentSummaryItem(summary, formattedTime));
+      output.push(...Agent.renderAgentSummaryItem(summary, formattedTime, config));
     } else {
       const obs = item.data as Observation;
       const time = formatTime(obs.created_at);
@@ -91,93 +75,102 @@ function renderDayTimelineAgent(
   return output;
 }
 
-/**
- * Render a single day's timeline items (human/terminal mode - file grouped with tables)
- */
-function renderDayTimelineHuman(
-  day: string,
-  dayItems: TimelineItem[],
-  fullObservationIds: Set<number>,
-  config: ContextConfig,
-  cwd: string,
+export function renderAgentTimeline(
+  timeline: TimelineItem[],
+  fullObservationIds: Set<Observation['id']>,
+  config: ContextConfig
 ): string[] {
   const output: string[] = [];
+  for (const [day, dayItems] of groupTimelineByDay(timeline)) {
+    output.push(...renderDayTimelineAgent(day, dayItems, fullObservationIds, config));
+  }
+  return output;
+}
 
-  output.push(...Human.renderHumanDayHeader(day));
+/**
+ * One complete row of the human (terminal) timeline.
+ *
+ * Row boundaries are kept as data: titles and narratives may contain newlines
+ * or text that looks like an observation ID, so rendered lines cannot tell
+ * where a complete entry begins or ends. The terminal preview truncates by
+ * dropping whole, oldest entries (#4252).
+ */
+export interface HumanTimelineEntry {
+  day: string;
+  file: string | null;
+  lines: string[];
+  /** The same row with its time shown, for when it becomes the first visible observation. */
+  linesWithTime?: string[];
+  summary: boolean;
+}
 
-  let currentFile: string | null = null;
-  let lastTime = '';
-
-  for (const item of dayItems) {
-    if (item.type === 'summary') {
-      currentFile = null;
-      lastTime = '';
-
-      const summary = item.data as SummaryTimelineItem;
-      const formattedTime = formatDateTime(summary.displayTime);
-      output.push(...Human.renderHumanSummaryItem(summary, formattedTime));
-    } else {
+export function buildHumanTimelineEntries(
+  timeline: TimelineItem[],
+  fullObservationIds: Set<Observation['id']>,
+  config: ContextConfig,
+  cwd: string
+): HumanTimelineEntry[] {
+  const entries: HumanTimelineEntry[] = [];
+  for (const [day, dayItems] of groupTimelineByDay(timeline)) {
+    let lastTime = '';
+    for (const item of dayItems) {
+      if (item.type === 'summary') {
+        lastTime = '';
+        const summary = item.data as SummaryTimelineItem;
+        entries.push({
+          day, file: null, summary: true,
+          lines: Human.renderHumanSummaryItem(summary, formatDateTime(summary.displayTime), config),
+        });
+        continue;
+      }
       const obs = item.data as Observation;
-      const file = extractFirstFile(obs.files_modified, cwd, obs.files_read);
       const time = formatTime(obs.created_at);
       const showTime = time !== lastTime;
       lastTime = time;
-
-      const shouldShowFull = fullObservationIds.has(obs.id);
-
-      // Check if we need a new file section
-      if (file !== currentFile) {
-        output.push(...Human.renderHumanFileHeader(file));
-        currentFile = file;
-      }
-
-      if (shouldShowFull) {
-        const detailField = getDetailField(obs, config);
-        output.push(...Human.renderHumanFullObservation(obs, time, showTime, detailField, config));
-      } else {
-        output.push(Human.renderHumanTableRow(obs, time, showTime, config));
-      }
+      const file = extractFirstFile(obs.files_modified, cwd, obs.files_read);
+      const detail = getDetailField(obs, config);
+      const full = fullObservationIds.has(obs.id);
+      entries.push({
+        day, file, summary: false,
+        lines: full
+          ? Human.renderHumanFullObservation(obs, time, showTime, detail, config)
+          : [Human.renderHumanTableRow(obs, time, showTime, config)],
+        linesWithTime: showTime ? undefined : full
+          ? Human.renderHumanFullObservation(obs, time, true, detail, config)
+          : [Human.renderHumanTableRow(obs, time, true, config)],
+      });
     }
   }
-
-  output.push('');
-
-  return output;
+  return entries;
 }
 
 /**
- * Render a single day's timeline items
+ * Render human entries, restoring the day and file headings and the first
+ * observation's time for whichever entries are present, so a list that lost
+ * its oldest entries still reads correctly.
  */
-export function renderDayTimeline(
-  day: string,
-  dayItems: TimelineItem[],
-  fullObservationIds: Set<number>,
-  config: ContextConfig,
-  cwd: string,
-  forHuman: boolean
-): string[] {
-  if (forHuman) {
-    return renderDayTimelineHuman(day, dayItems, fullObservationIds, config, cwd);
+export function renderHumanTimelineEntries(entries: HumanTimelineEntry[]): string[] {
+  const lines: string[] = [];
+  let day = '';
+  let file: string | null = null;
+  let seenObservation = false;
+  for (const entry of entries) {
+    if (entry.day !== day) {
+      if (day) lines.push('');
+      lines.push(...Human.renderHumanDayHeader(entry.day));
+      day = entry.day;
+      file = null;
+      seenObservation = false;
+    }
+    if (entry.summary) {
+      file = null;
+    } else if (entry.file !== file) {
+      lines.push(...Human.renderHumanFileHeader(entry.file!));
+      file = entry.file;
+    }
+    lines.push(...(!entry.summary && !seenObservation ? entry.linesWithTime ?? entry.lines : entry.lines));
+    if (!entry.summary) seenObservation = true;
   }
-  return renderDayTimelineAgent(day, dayItems, fullObservationIds, config);
-}
-
-/**
- * Render the complete timeline
- */
-export function renderTimeline(
-  timeline: TimelineItem[],
-  fullObservationIds: Set<number>,
-  config: ContextConfig,
-  cwd: string,
-  forHuman: boolean
-): string[] {
-  const output: string[] = [];
-  const itemsByDay = groupTimelineByDay(timeline);
-
-  for (const [day, dayItems] of itemsByDay) {
-    output.push(...renderDayTimeline(day, dayItems, fullObservationIds, config, cwd, forHuman));
-  }
-
-  return output;
+  if (day) lines.push('');
+  return lines;
 }

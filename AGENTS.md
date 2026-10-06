@@ -8,8 +8,8 @@
 - 本地调研记录：`docs/drafts/README.md`、`docs/drafts/2026-10-06-codebase-understanding.md`
 - Hook 入口：`plugin/hooks/hooks.json`、`src/cli/hook-command.ts`、`src/cli/handlers/`
 - Worker 编排：`src/services/worker-service.ts`、`src/services/worker/http/routes/`
-- Session/队列：`src/services/sqlite/SessionStore.ts`、`src/services/sqlite/PendingMessageStore.ts`、`src/services/worker/SessionManager.ts`
-- Agent 结果处理：`src/services/worker/SDKAgent.ts`、`src/services/worker/agents/ResponseProcessor.ts`
+- Session/队列：`src/services/sqlite/SessionStore.ts`、`src/services/worker/SessionManager.ts`（当前上游已不再有独立的 `PendingMessageStore.ts`）
+- Agent 结果处理：`src/services/worker/agents/ResponseProcessor.ts`、`src/services/worker/` 下的 provider 模块（当前上游已不再有独立的 `SDKAgent.ts`）
 - 存储/检索：`src/services/sqlite/`、`src/services/sync/ChromaSync.ts`、`src/services/worker/search/SearchOrchestrator.ts`
 - MCP/Viewer：`src/servers/mcp-server.ts`、`src/ui/viewer/`
 - 配置/路径：`src/shared/SettingsDefaultsManager.ts`、`src/shared/paths.ts`
@@ -27,4 +27,3 @@
 - 保持 `origin` 指向 `https://github.com/Blueforce-Tech-Inc/claude-mem.git`，保持 `upstream` 指向上游 `thedotmack/claude-mem`。
 - 同步上游前先检查工作区和本地提交；默认保护 `docs/drafts/` 及 fork 专属修改，不要用上游版本覆盖本地调研记录。
 - 上游同步后重新检查架构锚点、构建产物和测试；除非用户明确要求，不自动提交、推送或重写发布元数据。
-

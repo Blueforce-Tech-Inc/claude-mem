@@ -1,54 +1,52 @@
-/**
- * HeaderRenderer - Renders the context header sections
- *
- * Handles rendering of header, legend, column key, context index, and economics.
- */
 
 import type { ContextConfig, TokenEconomics } from '../types.js';
 import { shouldShowContextEconomics } from '../TokenCalculator.js';
+import { loadProjectEnvironments } from '../../../utils/project-name.js';
 import * as Agent from '../formatters/AgentFormatter.js';
 import * as Human from '../formatters/HumanFormatter.js';
 
 /**
- * Render the complete header section
+ * A named environment spans several directories; say so in the header so the
+ * model does not read the project name as one folder. The name only: the glob
+ * patterns would cost tokens on every session and add nothing for the model.
  */
+function projectHeaderLabel(project: string): string {
+  return loadProjectEnvironments().some(environment => environment.name === project)
+    ? `${project} (environment)`
+    : project;
+}
+
 export function renderHeader(
   project: string,
   economics: TokenEconomics,
   config: ContextConfig,
-  forHuman: boolean
+  forHuman: boolean,
+  /** The header's date and time; a placeholder when the block is cached (context-cache.ts). */
+  headerTime?: string
 ): string[] {
   const output: string[] = [];
+  const fetchByIdSupported = config.fetchByIdSupported !== false;
+  const projectDisplay = projectHeaderLabel(project);
 
-  // Main header
   if (forHuman) {
-    output.push(...Human.renderHumanHeader(project));
+    output.push(...Human.renderHumanHeader(projectDisplay, headerTime));
   } else {
-    output.push(...Agent.renderAgentHeader(project));
+    output.push(...Agent.renderAgentHeader(projectDisplay, headerTime));
   }
 
-  // Legend
   if (forHuman) {
     output.push(...Human.renderHumanLegend());
   } else {
-    output.push(...Agent.renderAgentLegend());
+    output.push(...Agent.renderAgentLegend(fetchByIdSupported));
   }
 
-  // Column key
+  // Agent variants render nothing; only the Human column-key / context-index
+  // arms produce output.
   if (forHuman) {
     output.push(...Human.renderHumanColumnKey());
-  } else {
-    output.push(...Agent.renderAgentColumnKey());
+    output.push(...Human.renderHumanContextIndex(fetchByIdSupported));
   }
 
-  // Context index instructions
-  if (forHuman) {
-    output.push(...Human.renderHumanContextIndex());
-  } else {
-    output.push(...Agent.renderAgentContextIndex());
-  }
-
-  // Context economics
   if (shouldShowContextEconomics(config)) {
     if (forHuman) {
       output.push(...Human.renderHumanContextEconomics(economics, config));

@@ -2,8 +2,7 @@ import { Database } from 'bun:sqlite';
 import { TableNameRow } from '../../types/database.js';
 import { DATA_DIR, DB_PATH, ensureDir } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
-import { isDirectChild } from '../../shared/path-utils.js';
-import { AppError } from '../server/ErrorHandler.js';
+import { isDirectChild, normalizePath } from '../../shared/path-utils.js';
 import {
   ObservationSearchResult,
   SessionSummarySearchResult,
@@ -11,62 +10,98 @@ import {
   SearchOptions,
   SearchFilters,
   DateRange,
-  ObservationRow,
-  UserPromptRow
+  ObservationRow
 } from './types.js';
+import { DEFAULT_PLATFORM_SOURCE, normalizePlatformSource } from '../../shared/platform-source.js';
+import { resolveDateBound } from '../../shared/date-bounds.js';
+import { applySqliteConnectionPragmas } from './connection.js';
+import { projectScopeSql, scopedProjects } from './project-read-keys.js';
+import { pageMatchingRows } from './stream-rows.js';
 
 /**
- * Search interface for session-based memory
- * Provides filter-only structured queries for sessions, observations, and user prompts
- * Vector search is handled by ChromaDB - this class only supports filtering without query text
+ * Code-point ranges of the scripts FTS5's unicode61 tokenizer cannot segment: Thai and Lao,
+ * Myanmar, Khmer, Hiragana/Katakana, Bopomofo and Hangul compatibility jamo, the CJK
+ * ideograph blocks, and Hangul syllables. See {@link SessionSearch.UNSEGMENTED_SCRIPT}.
  */
+const UNSEGMENTED_SCRIPT_RANGES =
+  '\\u0E00-\\u0EFF\\u1000-\\u109F\\u1780-\\u17FF\\u3040-\\u30FF\\u3100-\\u318F\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uAC00-\\uD7AF\\uF900-\\uFAFF';
+
+/**
+ * Sync triggers for the external-content FTS5 indexes, shared by FTS setup here and by the
+ * SessionStore migrations that rebuild these tables. The update triggers fire only when an
+ * indexed column is written: an unscoped AFTER UPDATE also fired for bookkeeping writes
+ * (sync_rev, merged_into_project, content_hash, ...), and every firing appended a delete
+ * marker plus a full re-insert of the row's text to the index (#2793).
+ */
+export const OBSERVATIONS_FTS_TRIGGERS_SQL = `
+  CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
+    INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
+    VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations BEGIN
+    INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
+    VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS observations_au
+  AFTER UPDATE OF title, subtitle, narrative, text, facts, concepts ON observations BEGIN
+    INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
+    VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
+    INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
+    VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
+  END;
+`;
+
+export const SESSION_SUMMARIES_FTS_TRIGGERS_SQL = `
+  CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
+    INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
+    VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
+    INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
+    VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS session_summaries_au
+  AFTER UPDATE OF request, investigated, learned, completed, next_steps, notes ON session_summaries BEGIN
+    INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
+    VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
+    INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
+    VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
+  END;
+`;
+
 export class SessionSearch {
   private db: Database;
 
-  private static readonly MISSING_SEARCH_INPUT_MESSAGE = 'Either query or filters required for search';
-
-  constructor(dbPath?: string) {
-    if (!dbPath) {
+  constructor(dbPathOrDb: string | Database = DB_PATH) {
+    if (dbPathOrDb instanceof Database) {
+      this.db = dbPathOrDb;
+    } else {
       ensureDir(DATA_DIR);
-      dbPath = DB_PATH;
+      this.db = new Database(dbPathOrDb);
     }
-    this.db = new Database(dbPath);
-    this.db.run('PRAGMA journal_mode = WAL');
 
-    // Ensure FTS tables exist
+    applySqliteConnectionPragmas(this.db);
+
+    this._fts5Available = this.isFts5Available();
+
     this.ensureFTSTables();
   }
 
-  /**
-   * Ensure FTS5 tables exist (backward compatibility only - no longer used for search)
-   *
-   * FTS5 tables are maintained for backward compatibility but not used for search.
-   * Vector search (Chroma) is now the primary search mechanism.
-   *
-   * Retention Rationale:
-   * - Prevents breaking existing installations with FTS5 tables
-   * - Allows graceful migration path for users
-   * - Tables maintained but search paths removed
-   * - Triggers still fire to keep tables synchronized
-   *
-   * FTS5 may be unavailable on some platforms (e.g., Bun on Windows #791).
-   * When unavailable, we skip FTS table creation — search falls back to
-   * ChromaDB (vector) and LIKE queries (structured filters) which are unaffected.
-   *
-   * TODO: Remove FTS5 infrastructure in future major version (v7.0.0)
-   */
-  private ensureFTSTables(): void {
-    // Check if FTS tables already exist
-    const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'").all() as TableNameRow[];
-    const hasFTS = tables.some(t => t.name === 'observations_fts' || t.name === 'session_summaries_fts');
+  private _fts5Available: boolean;
 
-    if (hasFTS) {
-      // Already migrated
+  private ensureFTSTables(): void {
+    const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'").all() as TableNameRow[];
+    const hasObservationsFTS = tables.some(t => t.name === 'observations_fts');
+    const hasSummariesFTS = tables.some(t => t.name === 'session_summaries_fts');
+
+    if (hasObservationsFTS && hasSummariesFTS) {
       return;
     }
 
-    // Runtime check: verify FTS5 is available before attempting to create tables.
-    // bun:sqlite on Windows may not include the FTS5 extension (#791).
     if (!this.isFts5Available()) {
       logger.warn('DB', 'FTS5 not available on this platform — skipping FTS table creation (search uses ChromaDB)');
       return;
@@ -75,7 +110,48 @@ export class SessionSearch {
     logger.info('DB', 'Creating FTS5 tables');
 
     try {
-      // Create observations_fts virtual table
+      this.db.transaction(() => {
+        // Another connection may have completed setup after the initial read.
+        // Hold the writer reservation while deciding which indexes we own.
+        const currentTables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'").all() as TableNameRow[];
+        const createObservations = !currentTables.some(t => t.name === 'observations_fts');
+        const createSummaries = !currentTables.some(t => t.name === 'session_summaries_fts');
+        this.createFTSTablesAndTriggers(createObservations, createSummaries);
+      }).immediate();
+      logger.info('DB', 'FTS5 tables created successfully');
+    } catch (error) {
+      this._fts5Available = false;
+      logger.warn('DB', 'FTS5 table creation failed — search will use ChromaDB and LIKE queries', {}, error instanceof Error ? error : undefined);
+    }
+  }
+
+  private isFts5Available(): boolean {
+    try {
+      this.db.run('CREATE VIRTUAL TABLE temp._fts5_probe USING fts5(test_column)');
+      this.db.run('DROP TABLE temp._fts5_probe');
+      return true;
+    } catch (error) {
+      logger.debug('DB', 'FTS5 probe failed — FTS5 unavailable on this platform', undefined, error instanceof Error ? error : new Error(String(error)));
+      return false;
+    }
+  }
+
+  /** An existing index can still be read when the writable probe is denied. */
+  private canReadFtsIndex(table: 'observations_fts' | 'session_summaries_fts'): boolean {
+    try {
+      // Preparing this read loads the virtual table and checks MATCH support
+      // without creating tables, changing the connection or scanning rows.
+      this.db.prepare(`SELECT rowid FROM ${table} WHERE ${table} MATCH ? LIMIT 0`).all('"fts_read_probe"');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private createFTSTablesAndTriggers(createObservations: boolean, createSummaries: boolean): void {
+    // Backfill only newly created indexes: reinserting into an existing FTS5
+    // external-content index can corrupt its delete/update bookkeeping.
+    if (createObservations) {
       this.db.run(`
         CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
           title,
@@ -89,34 +165,16 @@ export class SessionSearch {
         );
       `);
 
-      // Populate with existing data
       this.db.run(`
         INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
         SELECT id, title, subtitle, narrative, text, facts, concepts
         FROM observations;
       `);
 
-      // Create triggers for observations
-      this.db.run(`
-        CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
-          INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
-          VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-        END;
+      this.db.run(OBSERVATIONS_FTS_TRIGGERS_SQL);
+    }
 
-        CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations BEGIN
-          INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
-          VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations BEGIN
-          INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
-          VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-          INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
-          VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-        END;
-      `);
-
-      // Create session_summaries_fts virtual table
+    if (createSummaries) {
       this.db.run(`
         CREATE VIRTUAL TABLE IF NOT EXISTS session_summaries_fts USING fts5(
           request,
@@ -130,58 +188,16 @@ export class SessionSearch {
         );
       `);
 
-      // Populate with existing data
       this.db.run(`
         INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
         SELECT id, request, investigated, learned, completed, next_steps, notes
         FROM session_summaries;
       `);
 
-      // Create triggers for session_summaries
-      this.db.run(`
-        CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
-          INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
-          VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
-          INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
-          VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS session_summaries_au AFTER UPDATE ON session_summaries BEGIN
-          INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
-          VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-          INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
-          VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-        END;
-      `);
-
-      logger.info('DB', 'FTS5 tables created successfully');
-    } catch (error) {
-      // FTS5 creation failed at runtime despite probe succeeding — degrade gracefully
-      logger.warn('DB', 'FTS5 table creation failed — search will use ChromaDB and LIKE queries', {}, error as Error);
+      this.db.run(SESSION_SUMMARIES_FTS_TRIGGERS_SQL);
     }
   }
 
-  /**
-   * Probe whether the FTS5 extension is available in the current SQLite build.
-   * Creates and immediately drops a temporary FTS5 table.
-   */
-  private isFts5Available(): boolean {
-    try {
-      this.db.run('CREATE VIRTUAL TABLE _fts5_probe USING fts5(test_column)');
-      this.db.run('DROP TABLE _fts5_probe');
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-
-  /**
-   * Build WHERE clause for structured filters
-   */
   private buildFilterClause(
     filters: SearchFilters,
     params: any[],
@@ -189,13 +205,32 @@ export class SessionSearch {
   ): string {
     const conditions: string[] = [];
 
-    // Project filter
-    if (filters.project) {
-      conditions.push(`${tableAlias}.project = ?`);
-      params.push(filters.project);
+    const projects = scopedProjects(filters);
+    if (projects.length > 0) {
+      // #3641 — match the OR disjunction used by every other read path
+      // (SessionStore, PaginationHelper, ObservationCompiler). Without it the
+      // FTS/filter path ignores merged_into_project, so adopted worktree
+      // observations stay invisible to search even after adoption.
+      // #3531 — compared case-insensitively, like every other read path.
+      // Gate P2-5 — every key the checkout reads, not just its current one.
+      const scope = projectScopeSql(tableAlias, projects, { includeMerged: true });
+      conditions.push(scope.sql);
+      params.push(...scope.params);
     }
 
-    // Type filter (for observations only)
+    // Source-scoping (#2389): when a platformSource is supplied, restrict to
+    // rows whose owning sdk_session has that platform_source. observations and
+    // session_summaries both carry memory_session_id, which is the FK into
+    // sdk_sessions. COALESCE mirrors PaginationHelper: legacy rows with a NULL
+    // platform_source are treated as 'claude' so they never bleed into a
+    // codex/other-agent search.
+    if (filters.platformSource) {
+      conditions.push(
+        `COALESCE(NULLIF((SELECT s2.platform_source FROM sdk_sessions s2 WHERE s2.memory_session_id = ${tableAlias}.memory_session_id), ''), '${DEFAULT_PLATFORM_SOURCE}') = ?`
+      );
+      params.push(normalizePlatformSource(filters.platformSource));
+    }
+
     if (filters.type) {
       if (Array.isArray(filters.type)) {
         const placeholders = filters.type.map(() => '?').join(',');
@@ -207,22 +242,18 @@ export class SessionSearch {
       }
     }
 
-    // Date range filter
     if (filters.dateRange) {
       const { start, end } = filters.dateRange;
       if (start) {
-        const startEpoch = typeof start === 'number' ? start : new Date(start).getTime();
         conditions.push(`${tableAlias}.created_at_epoch >= ?`);
-        params.push(startEpoch);
+        params.push(resolveDateBound(start, 'start'));
       }
       if (end) {
-        const endEpoch = typeof end === 'number' ? end : new Date(end).getTime();
         conditions.push(`${tableAlias}.created_at_epoch <= ?`);
-        params.push(endEpoch);
+        params.push(resolveDateBound(end, 'end'));
       }
     }
 
-    // Concepts filter (JSON array search)
     if (filters.concepts) {
       const concepts = Array.isArray(filters.concepts) ? filters.concepts : [filters.concepts];
       const conceptConditions = concepts.map(() => {
@@ -234,19 +265,19 @@ export class SessionSearch {
       }
     }
 
-    // Files filter (JSON array search)
     if (filters.files) {
       const files = Array.isArray(filters.files) ? filters.files : [filters.files];
       const fileConditions = files.map(() => {
         return `(
-          EXISTS (SELECT 1 FROM json_each(${tableAlias}.files_read) WHERE value LIKE ?)
-          OR EXISTS (SELECT 1 FROM json_each(${tableAlias}.files_modified) WHERE value LIKE ?)
+          EXISTS (SELECT 1 FROM json_each(${tableAlias}.files_read) WHERE value LIKE ? ESCAPE '\\')
+          OR EXISTS (SELECT 1 FROM json_each(${tableAlias}.files_modified) WHERE value LIKE ? ESCAPE '\\')
         )`;
       });
       if (fileConditions.length > 0) {
         conditions.push(`(${fileConditions.join(' OR ')})`);
         files.forEach(file => {
-          params.push(`%${file}%`, `%${file}%`);
+          const literal = file.replace(/[\\%_]/g, '\\$&');
+          params.push(`%${literal}%`, `%${literal}%`);
         });
       }
     }
@@ -255,8 +286,90 @@ export class SessionSearch {
   }
 
   /**
-   * Build ORDER BY clause
+   * Scripts whose runs FTS5's unicode61 tokenizer cannot split: Hiragana, Katakana, the CJK
+   * ideograph blocks, Bopomofo, and Hangul. unicode61 breaks on Unicode whitespace and
+   * punctuation, and these scripts put neither between the characters of a run — so a run
+   * folds into a single token and no substring of it can ever match (#3801), which is every
+   * query a user types in them.
+   *
+   * Korean does space its words, so only the sub-word case is affected there — but that is
+   * still every partial-word query. Measured directly against `tokenize='unicode61'`:
+   *
+   *   설정   inside 설정을            -> 0 rows
+   *   설정을 as a whole token         -> 1 row
+   *   ㄓㄨ   inside ㄓㄨㄛ            -> 0 rows
+   *   项目   inside 修改了项目配置    -> 0 rows
+   *
+   * Bopomofo and Hangul were raised in review on #3810. The blocks are adjacent, so
+   * \u3100-\u318F covers Bopomofo together with the Hangul compatibility jamo beside it.
+   *
+   * Thai, Lao, Myanmar and Khmer write words without spaces too, so a run of them folds
+   * into one token the same way (`ภาษาไทย` inside a longer Thai run -> 0 rows).
    */
+  private static readonly UNSEGMENTED_SCRIPT = new RegExp(`[${UNSEGMENTED_SCRIPT_RANGES}]`);
+
+  /**
+   * Split the query into the runs the index cannot segment and the runs it can, so a
+   * mixed-script query is matched term by term instead of as one literal string. A
+   * substring search for the whole of `claude 队列` requires those characters to be
+   * adjacent, which is why mixed queries returned almost nothing (#3801 / #3982).
+   */
+  private static readonly UNSEGMENTED_RUN =
+    new RegExp(`[${UNSEGMENTED_SCRIPT_RANGES}]+|[^\\s${UNSEGMENTED_SCRIPT_RANGES}]+`, 'g');
+
+  /**
+   * The most distinct terms the substring predicate requires. It adds one LIKE group per
+   * term, and when SQLite plans the project filter's OR across its two indexes it chains
+   * every WHERE term into one AND expression, one level deeper per term. Past ~980 terms
+   * that fails with "Expression tree is too large (maximum depth 1000)", which a pasted
+   * wall of text (FTS never matches one, so it always lands here) used to hit. 500 leaves
+   * room for every other filter. A query with more distinct terms than this matches no
+   * record by its full AND anyway; its leading terms are kept.
+   */
+  static readonly MAX_SUBSTRING_TERMS = 500;
+
+  /**
+   * Build the substring predicate used when the index cannot represent the query. Each
+   * term must appear in at least one column, and every term must appear somewhere. The
+   * escaping matches {@link searchUserPrompts}, which has always searched by substring.
+   * A repeated term adds nothing to the AND, so terms are deduplicated before the cap.
+   */
+  private static buildSubstringClause(query: string, columns: string[]): { clause: string; params: string[] } {
+    const terms = [...new Set(query.match(SessionSearch.UNSEGMENTED_RUN) ?? [])]
+      .slice(0, SessionSearch.MAX_SUBSTRING_TERMS);
+    if (terms.length === 0) {
+      terms.push(query);
+    }
+    const params: string[] = [];
+    const groups = terms.map(term => {
+      const pattern = `%${term.replace(/[\\%_]/g, '\\$&')}%`;
+      for (let i = 0; i < columns.length; i += 1) {
+        params.push(pattern);
+      }
+      return `(${columns.map(column => `${column} LIKE ? ESCAPE '\\'`).join(' OR ')})`;
+    });
+    return { clause: `(${groups.join(' AND ')})`, params };
+  }
+
+  /**
+   * Build an FTS5 query that preserves literal-token safety while allowing multi-word
+   * input to behave as an AND of terms instead of an exact phrase.
+   *
+   * Tokens with no letter or digit (a lone `-`, `&`, `—`) are dropped: unicode61 indexes
+   * nothing for them, so each would become an empty phrase that matches no row and, ANDed
+   * in, would zero out the whole query.
+   */
+  private static buildFTSMatchQuery(query: string): string {
+    const tokens = (query.match(/\S+/g) ?? []).filter(token => /[\p{L}\p{N}]/u.test(token));
+    if (tokens.length === 0) {
+      return `"${query.replace(/"/g, '""')}"`;
+    }
+
+    return tokens
+      .map(token => `"${token.replace(/"/g, '""')}"`)
+      .join(' AND ');
+  }
+
   private buildOrderClause(orderBy: SearchOptions['orderBy'] = 'relevance', hasFTS: boolean = true, ftsTable: string = 'observations_fts'): string {
     switch (orderBy) {
       case 'relevance':
@@ -270,20 +383,71 @@ export class SessionSearch {
     }
   }
 
-  /**
-   * Search observations using filter-only direct SQLite query.
-   * Vector search is handled by ChromaDB - this only supports filtering without query text.
-   */
+  private searchObservationsBySubstring(
+    query: string,
+    filters: SearchFilters,
+    orderBy: SearchOptions['orderBy'],
+    limit: number,
+    offset: number
+  ): ObservationSearchResult[] {
+    const match = SessionSearch.buildSubstringClause(query, [
+      'o.title', 'o.subtitle', 'o.narrative', 'o.text', 'o.facts', 'o.concepts',
+    ]);
+    const filterParams: any[] = [];
+    const filterClause = this.buildFilterClause(filters, filterParams, 'o');
+
+    const sql = `
+      SELECT o.*, o.discovery_tokens
+      FROM observations o
+      WHERE ${match.clause}
+      ${filterClause ? 'AND ' + filterClause : ''}
+      ${this.buildOrderClause(orderBy, false)}
+      LIMIT ? OFFSET ?
+    `;
+
+    return this.db.prepare(sql).all(...match.params, ...filterParams, limit, offset) as ObservationSearchResult[];
+  }
+
+  private searchSessionsBySubstring(
+    query: string,
+    filters: SearchFilters,
+    orderBy: SearchOptions['orderBy'],
+    limit: number,
+    offset: number
+  ): SessionSummarySearchResult[] {
+    const match = SessionSearch.buildSubstringClause(query, [
+      's.request', 's.investigated', 's.learned', 's.completed', 's.next_steps', 's.notes',
+    ]);
+    const filterOptions = { ...filters };
+    delete filterOptions.type;
+    const filterParams: any[] = [];
+    const filterClause = this.buildFilterClause(filterOptions, filterParams, 's');
+    const orderClause = orderBy === 'date_asc'
+      ? 'ORDER BY s.created_at_epoch ASC'
+      : 'ORDER BY s.created_at_epoch DESC';
+
+    const sql = `
+      SELECT s.*, s.discovery_tokens
+      FROM session_summaries s
+      WHERE ${match.clause}
+      ${filterClause ? 'AND ' + filterClause : ''}
+      ${orderClause}
+      LIMIT ? OFFSET ?
+    `;
+
+    return this.db.prepare(sql).all(...match.params, ...filterParams, limit, offset) as SessionSummarySearchResult[];
+  }
+
   searchObservations(query: string | undefined, options: SearchOptions = {}): ObservationSearchResult[] {
     const params: any[] = [];
     const { limit = 50, offset = 0, orderBy = 'relevance', ...filters } = options;
 
-    // FILTER-ONLY PATH: When no query text, query table directly
-    // This enables date filtering which Chroma cannot do (requires direct SQLite access)
     if (!query) {
       const filterClause = this.buildFilterClause(filters, params, 'o');
       if (!filterClause) {
-        throw new AppError(SessionSearch.MISSING_SEARCH_INPUT_MESSAGE, 400, 'INVALID_SEARCH_REQUEST');
+        // No query text and no filters: nothing to match, so return an empty
+        // result set rather than treating a benign empty search as an error.
+        return [];
       }
 
       const orderClause = this.buildOrderClause(orderBy, false);
@@ -300,27 +464,58 @@ export class SessionSearch {
       return this.db.prepare(sql).all(...params) as ObservationSearchResult[];
     }
 
-    // Vector search with query text should be handled by ChromaDB
-    // This method only supports filter-only queries (query=undefined)
-    logger.warn('DB', 'Text search not supported - use ChromaDB for vector search');
-    return [];
+    if (SessionSearch.UNSEGMENTED_SCRIPT.test(query)) {
+      return this.searchObservationsBySubstring(query, filters, orderBy, limit, offset);
+    }
+
+    if (this._fts5Available || this.canReadFtsIndex('observations_fts')) {
+      const filterClause = this.buildFilterClause(filters, params, 'o');
+      const orderClause = this.buildOrderClause(orderBy, true, 'observations_fts');
+
+      const sql = `
+        SELECT o.*, o.discovery_tokens
+        FROM observations o
+        JOIN observations_fts ON observations_fts.rowid = o.id
+        WHERE observations_fts MATCH ?
+        ${filterClause ? 'AND ' + filterClause : ''}
+        ${orderClause}
+        LIMIT ? OFFSET ?
+      `;
+
+      params.unshift(SessionSearch.buildFTSMatchQuery(query));
+
+      let rows: ObservationSearchResult[];
+      try {
+        rows = this.db.prepare(sql).all(...params, limit, offset) as ObservationSearchResult[];
+      } catch (error) {
+        logger.warn('DB', 'FTS5 observation search failed', {}, error instanceof Error ? error : undefined);
+        throw error;
+      }
+      // An empty page past the end of real FTS matches stays empty.
+      if (rows.length > 0 || (offset > 0 && this.db.prepare(sql).all(...params, 1, 0).length > 0)) {
+        return rows;
+      }
+      // No FTS match at all. unicode61 folds a Latin run glued to ideographs (`payload优先使用LLM`)
+      // into one token that no FTS term can reach, so answer by substring, the same way queries in
+      // unsegmented scripts are answered. A query FTS already answers is never widened.
+      return this.searchObservationsBySubstring(query, filters, orderBy, limit, offset);
+    }
+
+    return this.searchObservationsBySubstring(query, filters, orderBy, limit, offset);
   }
 
-  /**
-   * Search session summaries using filter-only direct SQLite query.
-   * Vector search is handled by ChromaDB - this only supports filtering without query text.
-   */
   searchSessions(query: string | undefined, options: SearchOptions = {}): SessionSummarySearchResult[] {
     const params: any[] = [];
     const { limit = 50, offset = 0, orderBy = 'relevance', ...filters } = options;
 
-    // FILTER-ONLY PATH: When no query text, query session_summaries table directly
     if (!query) {
       const filterOptions = { ...filters };
       delete filterOptions.type;
       const filterClause = this.buildFilterClause(filterOptions, params, 's');
       if (!filterClause) {
-        throw new AppError(SessionSearch.MISSING_SEARCH_INPUT_MESSAGE, 400, 'INVALID_SEARCH_REQUEST');
+        // No query text and no filters: nothing to match, so return an empty
+        // result set rather than treating a benign empty search as an error.
+        return [];
       }
 
       const orderClause = orderBy === 'date_asc'
@@ -339,20 +534,54 @@ export class SessionSearch {
       return this.db.prepare(sql).all(...params) as SessionSummarySearchResult[];
     }
 
-    // Vector search with query text should be handled by ChromaDB
-    // This method only supports filter-only queries (query=undefined)
-    logger.warn('DB', 'Text search not supported - use ChromaDB for vector search');
-    return [];
+    if (SessionSearch.UNSEGMENTED_SCRIPT.test(query)) {
+      return this.searchSessionsBySubstring(query, filters, orderBy, limit, offset);
+    }
+
+    if (this._fts5Available || this.canReadFtsIndex('session_summaries_fts')) {
+      const filterOptions = { ...filters };
+      delete filterOptions.type;
+      const filterClause = this.buildFilterClause(filterOptions, params, 's');
+
+      const orderClause = orderBy === 'date_asc'
+        ? 'ORDER BY s.created_at_epoch ASC'
+        : orderBy === 'date_desc'
+          ? 'ORDER BY s.created_at_epoch DESC'
+          : 'ORDER BY session_summaries_fts.rank ASC';
+
+      const sql = `
+        SELECT s.*, s.discovery_tokens
+        FROM session_summaries s
+        JOIN session_summaries_fts ON session_summaries_fts.rowid = s.id
+        WHERE session_summaries_fts MATCH ?
+        ${filterClause ? 'AND ' + filterClause : ''}
+        ${orderClause}
+        LIMIT ? OFFSET ?
+      `;
+
+      params.unshift(SessionSearch.buildFTSMatchQuery(query));
+
+      let rows: SessionSummarySearchResult[];
+      try {
+        rows = this.db.prepare(sql).all(...params, limit, offset) as SessionSummarySearchResult[];
+      } catch (error) {
+        logger.warn('DB', 'FTS5 session search failed', {}, error instanceof Error ? error : undefined);
+        throw error;
+      }
+      if (rows.length > 0 || (offset > 0 && this.db.prepare(sql).all(...params, 1, 0).length > 0)) {
+        return rows;
+      }
+      // No FTS match at all: see searchObservations.
+      return this.searchSessionsBySubstring(query, filters, orderBy, limit, offset);
+    }
+
+    return this.searchSessionsBySubstring(query, filters, orderBy, limit, offset);
   }
 
-  /**
-   * Find observations by concept tag
-   */
   findByConcept(concept: string, options: SearchOptions = {}): ObservationSearchResult[] {
     const params: any[] = [];
     const { limit = 50, offset = 0, orderBy = 'date_desc', ...filters } = options;
 
-    // Add concept to filters
     const conceptFilters = { ...filters, concepts: concept };
     const filterClause = this.buildFilterClause(conceptFilters, params, 'o');
     const orderClause = this.buildOrderClause(orderBy, false);
@@ -370,9 +599,6 @@ export class SessionSearch {
     return this.db.prepare(sql).all(...params) as ObservationSearchResult[];
   }
 
-  /**
-   * Check if an observation has any files that are direct children of the folder
-   */
   private hasDirectChildFile(obs: ObservationSearchResult, folderPath: string): boolean {
     const checkFiles = (filesJson: string | null): boolean => {
       if (!filesJson) return false;
@@ -381,16 +607,15 @@ export class SessionSearch {
         if (Array.isArray(files)) {
           return files.some(f => isDirectChild(f, folderPath));
         }
-      } catch {}
+      } catch (error) {
+        logger.debug('DB', `Failed to parse files JSON for observation ${obs.id}`, undefined, error instanceof Error ? error : undefined);
+      }
       return false;
     };
 
     return checkFiles(obs.files_modified) || checkFiles(obs.files_read);
   }
 
-  /**
-   * Check if a session has any files that are direct children of the folder
-   */
   private hasDirectChildFileSession(session: SessionSummarySearchResult, folderPath: string): boolean {
     const checkFiles = (filesJson: string | null): boolean => {
       if (!filesJson) return false;
@@ -399,7 +624,9 @@ export class SessionSearch {
         if (Array.isArray(files)) {
           return files.some(f => isDirectChild(f, folderPath));
         }
-      } catch {}
+      } catch (error) {
+        logger.debug('DB', `Failed to parse files JSON for session summary ${session.id}`, undefined, error instanceof Error ? error : undefined);
+      }
       return false;
     };
 
@@ -407,96 +634,143 @@ export class SessionSearch {
   }
 
   /**
-   * Find observations and summaries by file path
-   * When isFolder=true, only returns results with files directly in the folder (not subfolders)
+   * LIKE patterns that find a path in a files JSON column.
+   *
+   * Stored paths come in two forms: absolute when they come from a tool's
+   * input (Claude Code's Read/Edit/Write), project-relative when they come
+   * from the observer's output or a Codex patch, and neither records the
+   * project root. So a folder given as an absolute path also matches paths
+   * stored under any trailing part of it, which is the rule isDirectChild
+   * applies to the fetched rows. Without these anchored prefixes the
+   * project-relative rows never reached that check and folder lookups missed
+   * them.
    */
+  private static filePathPatterns(filePath: string, isFolder: boolean): string[] {
+    const escape = (value: string) => value.replace(/[\\%_]/g, '\\$&');
+    const patterns = [`%${escape(filePath)}%`];
+    if (!isFolder || !/^([A-Za-z]:)?[\\/]/.test(filePath)) {
+      return patterns;
+    }
+    const segments = normalizePath(filePath).split('/').filter(segment => segment.length > 0);
+    const firstRelativeSegment = /^[A-Za-z]:$/.test(segments[0] ?? '') ? 1 : 0;
+    for (let start = firstRelativeSegment; start < segments.length; start += 1) {
+      const trailing = segments.slice(start);
+      patterns.push(`${escape(trailing.join('/') + '/')}%`);
+      if (filePath.includes('\\')) {
+        patterns.push(`${escape(trailing.join('\\') + '\\')}%`);
+      }
+    }
+    return patterns;
+  }
+
+  /** Any of `columns` (JSON arrays) holds a value matching any pattern; bind every pattern once per column. */
+  private static jsonArrayLikeClause(columns: string[], patternCount: number): string {
+    const anyPattern = Array.from({ length: patternCount }, () => "value LIKE ? ESCAPE '\\'").join(' OR ');
+    return `(${columns.map(column => `EXISTS (SELECT 1 FROM json_each(${column}) WHERE ${anyPattern})`).join(' OR ')})`;
+  }
+
   findByFile(filePath: string, options: SearchOptions = {}): {
     observations: ObservationSearchResult[];
     sessions: SessionSummarySearchResult[];
   } {
     const params: any[] = [];
     const { limit = 50, offset = 0, orderBy = 'date_desc', isFolder = false, ...filters } = options;
+    // filePath is the file filter; a caller's own `files` filter is not added on top.
+    delete filters.files;
 
-    // Query more results if we're filtering to direct children
-    const queryLimit = isFolder ? limit * 3 : limit;
+    // Folder matching removes nested descendants, so a folder query pages the
+    // matching rows (pageMatchingRows), not a guessed multiple of the broader
+    // SQL candidates.
+    const paginationSql = isFolder ? '' : 'LIMIT ? OFFSET ?';
+    const pathPatterns = SessionSearch.filePathPatterns(filePath, isFolder);
 
-    // Add file to filters
-    const fileFilters = { ...filters, files: filePath };
-    const filterClause = this.buildFilterClause(fileFilters, params, 'o');
-    const orderClause = this.buildOrderClause(orderBy, false);
+    const filterClause = this.buildFilterClause(filters, params, 'o');
+    params.push(...pathPatterns, ...pathPatterns);
+    const whereClause = [
+      filterClause,
+      SessionSearch.jsonArrayLikeClause(['o.files_read', 'o.files_modified'], pathPatterns.length),
+    ].filter(Boolean).join(' AND ');
+    const orderClause = `${this.buildOrderClause(orderBy, false)}, o.id ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}`;
 
     const observationsSql = `
       SELECT o.*, o.discovery_tokens
       FROM observations o
-      WHERE ${filterClause}
+      WHERE ${whereClause}
       ${orderClause}
-      LIMIT ? OFFSET ?
+      ${paginationSql}
     `;
 
-    params.push(queryLimit, offset);
+    if (!isFolder) params.push(limit, offset);
 
-    let observations = this.db.prepare(observationsSql).all(...params) as ObservationSearchResult[];
+    const observationStatement = this.db.prepare(observationsSql);
+    const observations = isFolder
+      ? pageMatchingRows<ObservationSearchResult>(
+          observationStatement,
+          params,
+          obs => this.hasDirectChildFile(obs, filePath),
+          { limit, offset },
+        )
+      : observationStatement.all(...params) as ObservationSearchResult[];
 
-    // Post-filter to direct children if isFolder mode
-    if (isFolder) {
-      observations = observations.filter(obs => this.hasDirectChildFile(obs, filePath)).slice(0, limit);
-    }
-
-    // For session summaries, search files_read and files_edited
     const sessionParams: any[] = [];
     const sessionFilters = { ...filters };
-    delete sessionFilters.type; // Remove type filter for sessions
+    delete sessionFilters.type; 
 
     const baseConditions: string[] = [];
-    if (sessionFilters.project) {
-      baseConditions.push('s.project = ?');
-      sessionParams.push(sessionFilters.project);
+    // Gate P2-16 — summaries merged into the project (an adopted worktree's)
+    // count, as they do for observations above and on every other read path.
+    const sessionProjects = scopedProjects(sessionFilters);
+    if (sessionProjects.length > 0) {
+      const scope = projectScopeSql('s', sessionProjects, { includeMerged: true });
+      baseConditions.push(scope.sql);
+      sessionParams.push(...scope.params);
+    }
+
+    if (sessionFilters.platformSource) {
+      baseConditions.push(
+        `COALESCE(NULLIF((SELECT s2.platform_source FROM sdk_sessions s2 WHERE s2.memory_session_id = s.memory_session_id), ''), '${DEFAULT_PLATFORM_SOURCE}') = ?`
+      );
+      sessionParams.push(normalizePlatformSource(sessionFilters.platformSource));
     }
 
     if (sessionFilters.dateRange) {
       const { start, end } = sessionFilters.dateRange;
       if (start) {
-        const startEpoch = typeof start === 'number' ? start : new Date(start).getTime();
         baseConditions.push('s.created_at_epoch >= ?');
-        sessionParams.push(startEpoch);
+        sessionParams.push(resolveDateBound(start, 'start'));
       }
       if (end) {
-        const endEpoch = typeof end === 'number' ? end : new Date(end).getTime();
         baseConditions.push('s.created_at_epoch <= ?');
-        sessionParams.push(endEpoch);
+        sessionParams.push(resolveDateBound(end, 'end'));
       }
     }
 
-    // File condition
-    baseConditions.push(`(
-      EXISTS (SELECT 1 FROM json_each(s.files_read) WHERE value LIKE ?)
-      OR EXISTS (SELECT 1 FROM json_each(s.files_edited) WHERE value LIKE ?)
-    )`);
-    sessionParams.push(`%${filePath}%`, `%${filePath}%`);
+    baseConditions.push(SessionSearch.jsonArrayLikeClause(['s.files_read', 's.files_edited'], pathPatterns.length));
+    sessionParams.push(...pathPatterns, ...pathPatterns);
 
     const sessionsSql = `
       SELECT s.*, s.discovery_tokens
       FROM session_summaries s
       WHERE ${baseConditions.join(' AND ')}
-      ORDER BY s.created_at_epoch DESC
-      LIMIT ? OFFSET ?
+      ORDER BY s.created_at_epoch ${orderBy === 'date_asc' ? 'ASC' : 'DESC'}
+      ${paginationSql}
     `;
 
-    sessionParams.push(queryLimit, offset);
+    if (!isFolder) sessionParams.push(limit, offset);
 
-    let sessions = this.db.prepare(sessionsSql).all(...sessionParams) as SessionSummarySearchResult[];
-
-    // Post-filter to direct children if isFolder mode
-    if (isFolder) {
-      sessions = sessions.filter(s => this.hasDirectChildFileSession(s, filePath)).slice(0, limit);
-    }
+    const sessionStatement = this.db.prepare(sessionsSql);
+    const sessions = isFolder
+      ? pageMatchingRows<SessionSummarySearchResult>(
+          sessionStatement,
+          sessionParams,
+          row => this.hasDirectChildFileSession(row, filePath),
+          { limit, offset },
+        )
+      : sessionStatement.all(...sessionParams) as SessionSummarySearchResult[];
 
     return { observations, sessions };
   }
 
-  /**
-   * Find observations by type
-   */
   findByType(
     type: ObservationRow['type'] | ObservationRow['type'][],
     options: SearchOptions = {}
@@ -504,7 +778,6 @@ export class SessionSearch {
     const params: any[] = [];
     const { limit = 50, offset = 0, orderBy = 'date_desc', ...filters } = options;
 
-    // Add type to filters
     const typeFilters = { ...filters, type };
     const filterClause = this.buildFilterClause(typeFilters, params, 'o');
     const orderClause = this.buildOrderClause(orderBy, false);
@@ -522,39 +795,40 @@ export class SessionSearch {
     return this.db.prepare(sql).all(...params) as ObservationSearchResult[];
   }
 
-  /**
-   * Search user prompts using filter-only direct SQLite query.
-   * Vector search is handled by ChromaDB - this only supports filtering without query text.
-   */
   searchUserPrompts(query: string | undefined, options: SearchOptions = {}): UserPromptSearchResult[] {
     const params: any[] = [];
     const { limit = 20, offset = 0, orderBy = 'relevance', ...filters } = options;
 
-    // Build filter conditions (join with sdk_sessions for project filtering)
     const baseConditions: string[] = [];
-    if (filters.project) {
-      baseConditions.push('s.project = ?');
-      params.push(filters.project);
+    const projects = scopedProjects(filters);
+    if (projects.length > 0) {
+      const scope = projectScopeSql('s', projects, { includeMerged: false });
+      baseConditions.push(scope.sql);
+      params.push(...scope.params);
+    }
+
+    if (filters.platformSource) {
+      baseConditions.push(`COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') = ?`);
+      params.push(normalizePlatformSource(filters.platformSource));
     }
 
     if (filters.dateRange) {
       const { start, end } = filters.dateRange;
       if (start) {
-        const startEpoch = typeof start === 'number' ? start : new Date(start).getTime();
         baseConditions.push('up.created_at_epoch >= ?');
-        params.push(startEpoch);
+        params.push(resolveDateBound(start, 'start'));
       }
       if (end) {
-        const endEpoch = typeof end === 'number' ? end : new Date(end).getTime();
         baseConditions.push('up.created_at_epoch <= ?');
-        params.push(endEpoch);
+        params.push(resolveDateBound(end, 'end'));
       }
     }
 
-    // FILTER-ONLY PATH: When no query text, query user_prompts table directly
     if (!query) {
       if (baseConditions.length === 0) {
-        throw new AppError(SessionSearch.MISSING_SEARCH_INPUT_MESSAGE, 400, 'INVALID_SEARCH_REQUEST');
+        // No query text and no filters: nothing to match, so return an empty
+        // result set rather than treating a benign empty search as an error.
+        return [];
       }
 
       const whereClause = `WHERE ${baseConditions.join(' AND ')}`;
@@ -563,9 +837,13 @@ export class SessionSearch {
         : 'ORDER BY up.created_at_epoch DESC';
 
       const sql = `
-        SELECT up.*
+        SELECT
+          up.*,
+          s.project,
+          s.memory_session_id,
+          COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') as platform_source
         FROM user_prompts up
-        JOIN sdk_sessions s ON up.content_session_id = s.content_session_id
+        JOIN sdk_sessions s ON up.session_db_id = s.id
         ${whereClause}
         ${orderClause}
         LIMIT ? OFFSET ?
@@ -575,35 +853,32 @@ export class SessionSearch {
       return this.db.prepare(sql).all(...params) as UserPromptSearchResult[];
     }
 
-    // Vector search with query text should be handled by ChromaDB
-    // This method only supports filter-only queries (query=undefined)
-    logger.warn('DB', 'Text search not supported - use ChromaDB for vector search');
-    return [];
-  }
+    const escapedQuery = query.replace(/[\\%_]/g, '\\$&');
+    baseConditions.push("up.prompt_text LIKE ? ESCAPE '\\'");
+    params.push(`%${escapedQuery}%`);
 
-  /**
-   * Get all prompts for a session by content_session_id
-   */
-  getUserPromptsBySession(contentSessionId: string): UserPromptRow[] {
-    const stmt = this.db.prepare(`
+    const whereClause = `WHERE ${baseConditions.join(' AND ')}`;
+    const orderClause = orderBy === 'date_asc'
+      ? 'ORDER BY up.created_at_epoch ASC'
+      : 'ORDER BY up.created_at_epoch DESC';
+
+    const sql = `
       SELECT
-        id,
-        content_session_id,
-        prompt_number,
-        prompt_text,
-        created_at,
-        created_at_epoch
-      FROM user_prompts
-      WHERE content_session_id = ?
-      ORDER BY prompt_number ASC
-    `);
+        up.*,
+        s.project,
+        s.memory_session_id,
+        COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') as platform_source
+      FROM user_prompts up
+      JOIN sdk_sessions s ON up.session_db_id = s.id
+      ${whereClause}
+      ${orderClause}
+      LIMIT ? OFFSET ?
+    `;
 
-    return stmt.all(contentSessionId) as UserPromptRow[];
+    params.push(limit, offset);
+    return this.db.prepare(sql).all(...params) as UserPromptSearchResult[];
   }
 
-  /**
-   * Close the database connection
-   */
   close(): void {
     this.db.close();
   }

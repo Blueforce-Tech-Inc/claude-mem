@@ -1,9 +1,3 @@
-/**
- * AgentFormatter - Formats context output as compact markdown for LLM injection
- *
- * Optimized for token efficiency: flat lines instead of tables, no repeated headers.
- * The human-readable terminal formatter (HumanFormatter.ts) handles human-readable display separately.
- */
 
 import type {
   ContextConfig,
@@ -14,64 +8,41 @@ import type {
 } from '../types.js';
 import { ModeManager } from '../../domain/ModeManager.js';
 import { formatObservationTokenDisplay } from '../TokenCalculator.js';
+import { formatHeaderDateTime } from '../../../shared/timeline-formatting.js';
+import { formatContextReferenceId } from './id-display.js';
 
-/**
- * Format current date/time for header display
- */
-function formatHeaderDateTime(): string {
-  const now = new Date();
-  const date = now.toLocaleDateString('en-CA'); // YYYY-MM-DD format
-  const time = now.toLocaleTimeString('en-US', {
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  }).toLowerCase().replace(' ', '');
-  const tz = now.toLocaleTimeString('en-US', { timeZoneName: 'short' }).split(' ').pop();
-  return `${date} ${time} ${tz}`;
+function formatActiveMode(): string {
+  const manager = ModeManager.getInstance();
+  const mode = manager.getActiveMode();
+  return `${mode.name} (${manager.getActiveModeId()})`;
 }
 
-/**
- * Render agent header
- */
-export function renderAgentHeader(project: string): string[] {
+export function renderAgentHeader(project: string, headerTime: string = formatHeaderDateTime()): string[] {
   return [
-    `# [${project}] recent context, ${formatHeaderDateTime()}`,
+    `# [${project}] recent context, ${headerTime}`,
+    `Mode: ${formatActiveMode()}`,
     ''
   ];
 }
 
-/**
- * Render agent legend
- */
-export function renderAgentLegend(): string[] {
+export function renderAgentLegend(fetchByIdSupported: boolean = true): string[] {
   const mode = ModeManager.getInstance().getActiveMode();
   const typeLegendItems = mode.observation_types.map(t => `${t.emoji}${t.id}`).join(' ');
+
+  // Server runtime: ids are UUIDs shown as 8-char display refs, and there is no
+  // by-id fetch, so point at the server's search tool instead.
+  const fetchLine = fetchByIdSupported
+    ? `Fetch details: get_observations([IDs]) | Search: mem-search skill`
+    : `Fetch details: observation_search by title (short refs are display-only)`;
 
   return [
     `Legend: 🎯session ${typeLegendItems}`,
     `Format: ID TIME TYPE TITLE`,
-    `Fetch details: get_observations([IDs]) | Search: mem-search skill`,
+    fetchLine,
     ''
   ];
 }
 
-/**
- * Render agent column key - no longer needed in compact format
- */
-export function renderAgentColumnKey(): string[] {
-  return [];
-}
-
-/**
- * Render agent context index instructions - folded into legend
- */
-export function renderAgentContextIndex(): string[] {
-  return [];
-}
-
-/**
- * Render agent context economics
- */
 export function renderAgentContextEconomics(
   economics: TokenEconomics,
   config: ContextConfig
@@ -97,48 +68,29 @@ export function renderAgentContextEconomics(
   return output;
 }
 
-/**
- * Render agent day header
- */
 export function renderAgentDayHeader(day: string): string[] {
   return [
     `### ${day}`,
   ];
 }
 
-/**
- * Render agent file header - no longer renders table headers in compact format
- */
-export function renderAgentFileHeader(_file: string): string[] {
-  // File grouping eliminated in compact format - file context is in observation titles
-  return [];
-}
-
-/**
- * Format compact time: "9:23 AM" → "9:23a", "12:05 PM" → "12:05p"
- */
 function compactTime(time: string): string {
   return time.toLowerCase().replace(' am', 'a').replace(' pm', 'p');
 }
 
-/**
- * Render compact flat line for observation (replaces table row)
- */
 export function renderAgentTableRow(
   obs: Observation,
   timeDisplay: string,
-  _config: ContextConfig
+  config: ContextConfig
 ): string {
   const title = obs.title || 'Untitled';
   const icon = ModeManager.getInstance().getTypeIcon(obs.type);
   const time = timeDisplay ? compactTime(timeDisplay) : '"';
+  const refId = formatContextReferenceId(obs.id, config);
 
-  return `${obs.id} ${time} ${icon} ${title}`;
+  return `${refId} ${time} ${icon} ${title}`;
 }
 
-/**
- * Render agent full observation
- */
 export function renderAgentFullObservation(
   obs: Observation,
   timeDisplay: string,
@@ -150,8 +102,9 @@ export function renderAgentFullObservation(
   const icon = ModeManager.getInstance().getTypeIcon(obs.type);
   const time = timeDisplay ? compactTime(timeDisplay) : '"';
   const { readTokens, discoveryDisplay } = formatObservationTokenDisplay(obs, config);
+  const refId = formatContextReferenceId(obs.id, config);
 
-  output.push(`**${obs.id}** ${time} ${icon} **${title}**`);
+  output.push(`**${refId}** ${time} ${icon} **${title}**`);
   if (detailField) {
     output.push(detailField);
   }
@@ -171,29 +124,21 @@ export function renderAgentFullObservation(
   return output;
 }
 
-/**
- * Render agent summary item in timeline
- */
 export function renderAgentSummaryItem(
-  summary: { id: number; request: string | null },
-  formattedTime: string
+  summary: { id: number | string; request: string | null },
+  formattedTime: string,
+  config: Pick<ContextConfig, 'fetchByIdSupported'> = {}
 ): string[] {
   return [
-    `S${summary.id} ${summary.request || 'Session started'} (${formattedTime})`,
+    `S${formatContextReferenceId(summary.id, config)} ${summary.request || 'Session started'} (${formattedTime})`,
   ];
 }
 
-/**
- * Render agent summary field
- */
 export function renderAgentSummaryField(label: string, value: string | null): string[] {
   if (!value) return [];
   return [`**${label}**: ${value}`, ''];
 }
 
-/**
- * Render agent previously section
- */
 export function renderAgentPreviouslySection(priorMessages: PriorMessages): string[] {
   if (!priorMessages.assistantMessage) return [];
 
@@ -208,20 +153,21 @@ export function renderAgentPreviouslySection(priorMessages: PriorMessages): stri
   ];
 }
 
-/**
- * Render agent footer
- */
-export function renderAgentFooter(totalDiscoveryTokens: number, totalReadTokens: number): string[] {
+export function renderAgentFooter(
+  totalDiscoveryTokens: number,
+  totalReadTokens: number,
+  fetchByIdSupported: boolean = true
+): string[] {
   const workTokensK = Math.round(totalDiscoveryTokens / 1000);
+  const accessPath = fetchByIdSupported
+    ? 'get_observations([IDs]) or mem-search skill'
+    : 'observation_search';
   return [
     '',
-    `Access ${workTokensK}k tokens of past work via get_observations([IDs]) or mem-search skill.`
+    `Access ${workTokensK}k tokens of past work via ${accessPath}.`
   ];
 }
 
-/**
- * Render agent empty state
- */
-export function renderAgentEmptyState(project: string): string {
-  return `# [${project}] recent context, ${formatHeaderDateTime()}\n\nNo previous sessions found.`;
+export function renderAgentEmptyState(project: string, headerTime: string = formatHeaderDateTime()): string {
+  return `# [${project}] recent context, ${headerTime}\nMode: ${formatActiveMode()}\n\nNo previous sessions found.`;
 }
