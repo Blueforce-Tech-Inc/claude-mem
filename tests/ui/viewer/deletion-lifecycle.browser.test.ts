@@ -97,6 +97,7 @@ for(const scenario of ['item','recreated-visible','recreated-session','late-dele
         files_read:'[]',files_modified:'[]',created_at_epoch:1,created_at:'2026-10-05T00:00:00Z'};
       const send=(event:unknown)=>controller!.enqueue(new TextEncoder().encode('data: '+JSON.stringify(event)+'\n\n'));
       let deleted=false;
+      let deleteRequestReceived=false;
       let observationRequests=0;
       const offsets:number[]=[];
       server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
@@ -106,7 +107,10 @@ for(const scenario of ['item','recreated-visible','recreated-session','late-dele
         if(url.pathname==='/ready'){markReady();return new Response('ready')}
         if(url.pathname==='/stream')return new Response(new ReadableStream({start(c){controller=c;send({type:'initial_load',projects:['alpha']})}}),
           {headers:{'Content-Type':'text/event-stream'}});
-        if(url.pathname==='/api/sessions/claude/owned-session' && request.method==='DELETE') {
+        if(url.pathname==='/api/sessions' && request.method==='DELETE'
+          && url.searchParams.get('platformSource')==='claude'
+          && url.searchParams.get('contentSessionId')==='owned-session') {
+          deleteRequestReceived=true;
           if(scenario==='live-before-delete')await deleteGate;
           deleted=true;if(scenario==='late-delete-response')send({type:'session_deleted',platformSource:'claude',contentSessionId:'owned-session'});
           if(scenario!=='live-before-delete')await deleteGate;return Response.json({success:true});
@@ -135,7 +139,7 @@ for(const scenario of ['item','recreated-visible','recreated-session','late-dele
         if(url.pathname==='/recreate'){deleted=false;if(!['catalog-recreated'].includes(scenario))send({type:'new_observation',observation:{...row,id:2,title:'RECREATED_CAPTURE'}});return new Response('recreated')}
         if(url.pathname==='/offsets')return Response.json(offsets);
         if(url.pathname==='/release'){release();return new Response('released')}
-        if(url.pathname==='/result'){finish(await request.json());return new Response('received')}
+        if(url.pathname==='/result'){finish({...await request.json(),deleteRequestReceived});return new Response('received')}
         return Response.json({});
       }});
       child=Bun.spawn([chrome!,'--headless','--no-sandbox','--disable-gpu','--disable-background-networking',
@@ -145,11 +149,11 @@ for(const scenario of ['item','recreated-visible','recreated-session','late-dele
       await Promise.race([ready,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('Viewer did not become ready')),30000)})]);
       clearTimeout(timer);
       const received=await Promise.race([result,new Promise(resolve=>{timer=setTimeout(()=>resolve({failure:'Browser page timed out'}),25000)})]);
-      if(scenario==='catalog-recreated'){expect(received).toEqual({detailFresh:true});return;}
+      if(scenario==='catalog-recreated'){expect(received).toEqual({detailFresh:true,deleteRequestReceived:false});return;}
       // item: the deleted row was never loaded, so this tab cannot attribute it
       // to a session and the card count stays stale until the server names the
       // owning session in item_deleted.
-      expect(received).toEqual({count:['recreated-session','live-before-delete'].includes(scenario)?null:'1 memory',ghost:false,recreatedGhost:scenario!=='item'&&!['recreated-session','live-before-delete'].includes(scenario),control:true,next:true,offsets:[0,UI.PAGINATION_PAGE_SIZE-1]});
+      expect(received).toEqual({count:['recreated-session','live-before-delete'].includes(scenario)?null:'1 memory',ghost:false,recreatedGhost:scenario!=='item'&&!['recreated-session','live-before-delete'].includes(scenario),control:true,next:true,offsets:[0,UI.PAGINATION_PAGE_SIZE-1],deleteRequestReceived:['late-delete-response','live-before-delete'].includes(scenario)});
     }finally{
       release();releaseDelete();clearTimeout(timer);
       if(child){child.kill();await child.exited;}

@@ -43,27 +43,45 @@ for (const key of ['Enter', 'Space'] as const) {
         if (existsSync(portFile)) port = readFileSync(portFile, 'utf8').split('\n')[0];
         if (!/^\d+$/.test(port)) await Bun.sleep(10);
       }
-      const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
+      const targetResponse = await fetch(`http://127.0.0.1:${port}/json/list`, {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!targetResponse.ok) throw new Error(`DevTools target lookup failed: HTTP ${targetResponse.status}`);
+      const targets = await targetResponse.json();
       const target = targets.find((entry: any) => entry.type === 'page' && entry.url === server.url.href);
       if (!target) throw new Error('Owned browser page was not found');
       socket = new WebSocket(target.webSocketDebuggerUrl);
       await new Promise<void>((resolve, reject) => {
-        socket!.addEventListener('open', () => resolve(), { once: true });
-        socket!.addEventListener('error', () => reject(new Error('CDP connection failed')), { once: true });
+        const timeout = setTimeout(() => reject(new Error('CDP connection timed out')), 5000);
+        socket!.addEventListener('open', () => { clearTimeout(timeout); resolve(); }, { once: true });
+        socket!.addEventListener('error', () => {
+          clearTimeout(timeout);
+          reject(new Error('CDP connection failed'));
+        }, { once: true });
       });
       let id = 0;
-      const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+      const pending = new Map<number, {
+        resolve: (value: any) => void;
+        reject: (error: Error) => void;
+        timeout: ReturnType<typeof setTimeout>;
+      }>();
       socket.addEventListener('message', event => {
         const data = JSON.parse(String(event.data));
         const request = pending.get(data.id);
         if (request) {
           pending.delete(data.id);
+          clearTimeout(request.timeout);
           if (data.error) request.reject(new Error(data.error.message));
           else request.resolve(data.result);
         }
       });
       const send = (method: string, params: object = {}) => new Promise<any>((resolve, reject) => {
-        const requestId = ++id; pending.set(requestId, { resolve, reject });
+        const requestId = ++id;
+        const timeout = setTimeout(() => {
+          pending.delete(requestId);
+          reject(new Error(`CDP request timed out: ${method}`));
+        }, 5000);
+        pending.set(requestId, { resolve, reject, timeout });
         socket!.send(JSON.stringify({ id: requestId, method, params }));
       });
       const evaluate = async (expression: string) => {
@@ -71,7 +89,14 @@ for (const key of ['Enter', 'Space'] as const) {
         if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
         return result.result.value;
       };
-      const settle = () => evaluate('new Promise(async resolve => { for(let i=0;i<4;i++) await new Promise(requestAnimationFrame); resolve(true); })');
+      const waitFor = async (expression: string, description: string) => {
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          if (await evaluate(expression)) return;
+          await Bun.sleep(25);
+        }
+        throw new Error(`Timed out waiting for ${description}`);
+      };
       const press = async (value: 'Enter' | 'Space' | 'Escape') => {
         const code = value === 'Enter' ? 13 : value === 'Space' ? 32 : 27;
         const event = { key: value === 'Space' ? ' ' : value, code: value,
@@ -79,7 +104,6 @@ for (const key of ['Enter', 'Space'] as const) {
         const text = value === 'Enter' ? '\r' : value === 'Space' ? ' ' : undefined;
         await send('Input.dispatchKeyEvent', { type: 'keyDown', ...event, text, unmodifiedText: text });
         await send('Input.dispatchKeyEvent', { type: 'keyUp', ...event });
-        await settle();
       };
       const renderDeadline = Date.now() + 10000;
       while (!await evaluate('!!document.querySelector(".session-card")')) {
@@ -87,18 +111,26 @@ for (const key of ['Enter', 'Space'] as const) {
         await Bun.sleep(10);
       }
       await evaluate('document.querySelector(".session-card").focus()'); await press(key);
+      await waitFor('window.opens === 1', 'session card keyboard activation');
       const ownCardOpens = await evaluate('window.opens');
       await evaluate('window.opens=0;document.querySelector(".session-card-menu-trigger").focus()');
       await press(key);
+      await waitFor('!!document.querySelector(".session-card-menu") || window.opens !== 0', 'session action button activation');
       const buttonOpens = await evaluate('window.opens');
       const menuOpened = await evaluate('!!document.querySelector(".session-card-menu")');
       // Keep the later native Delete regression observable even on the broken baseline.
-      if (!menuOpened) { await evaluate('document.querySelector(".session-card-menu-trigger").click()'); await settle(); }
+      if (!menuOpened) {
+        await evaluate('document.querySelector(".session-card-menu-trigger").click()');
+        await waitFor('!!document.querySelector(".session-card-menu")', 'session actions menu opening');
+      }
       await press('Escape');
+      await waitFor('!document.querySelector(".session-card-menu")', 'Escape menu dismissal');
       const escaped = await evaluate('!document.querySelector(".session-card-menu")');
-      await evaluate('document.querySelector(".session-card-menu-trigger").click()'); await settle();
+      await evaluate('document.querySelector(".session-card-menu-trigger").click()');
+      await waitFor('!!document.querySelector(".session-card-menu")', 'session actions menu reopening');
       await evaluate('window.opens=0;document.querySelector(".session-card-menu-item--danger").focus()');
       await press(key);
+      await waitFor('window.deletes === 1 || window.opens !== 0', 'delete menu keyboard activation');
       const deleteOpens = await evaluate('window.opens');
       const deletes = await evaluate('window.deletes');
       expect({ ownCardOpens, buttonOpens, menuOpened, deleteOpens, deletes, escaped }).toEqual({
