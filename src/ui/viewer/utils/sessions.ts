@@ -29,10 +29,12 @@ export interface SessionScopedRow {
   content_session_id?: string | null;
   session_id?: string | null;
   platform_source?: string | null;
+  standalone_kind?: string | null;
 }
 
 /** The session a feed row belongs to, or null when the row does not say. */
 export function sessionRefOf(row: SessionScopedRow): SessionRef | null {
+  if (row.standalone_kind) return null;
   const contentSessionId = row.content_session_id ?? row.session_id;
   if (!contentSessionId) return null;
   return { platformSource: row.platform_source || 'claude', contentSessionId };
@@ -89,7 +91,11 @@ export function describeSessionDeleteFailure(status: number): string {
  * sync-safe endpoint. Rejects with a user-facing message.
  */
 export async function deleteSession(ref: SessionRef, fetchImpl: typeof fetch = fetch): Promise<void> {
-  const url = `${API_ENDPOINTS.SESSIONS}/${encodeURIComponent(ref.platformSource)}/${encodeURIComponent(ref.contentSessionId)}`;
+  const params = new URLSearchParams({
+    platformSource: ref.platformSource,
+    contentSessionId: ref.contentSessionId,
+  });
+  const url = `${API_ENDPOINTS.SESSIONS}?${params.toString()}`;
   const response = await fetchImpl(url, { method: 'DELETE' }).catch(() => {
     throw new Error('Not deleted: the claude-mem worker could not be reached.');
   });

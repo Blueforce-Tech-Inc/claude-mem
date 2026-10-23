@@ -30,6 +30,8 @@ describe('session identity is (platform, content session id)', () => {
     expect(sessionRefOf({ content_session_id: 'abc-123', platform_source: 'codex' })).toEqual(codexRef);
     expect(sessionRefOf({ session_id: 'abc-123', platform_source: 'claude' })).toEqual(claudeRef);
     expect(sessionRefOf({ content_session_id: 'abc-123' })).toEqual(claudeRef);
+    expect(sessionRefOf({ content_session_id: 'manual-memories', standalone_kind: 'manual', platform_source: 'claude' }))
+      .toBeNull();
     expect(sessionRefOf({ platform_source: 'claude' })).toBeNull();
   });
 });
@@ -66,7 +68,7 @@ describe('session_deleted SSE events', () => {
 });
 
 describe('deleting a session from the viewer', () => {
-  it('DELETEs the composite route with both halves encoded', async () => {
+  it('DELETEs the opaque-safe query route with both halves encoded', async () => {
     const calls: Array<{ url: string; method?: string }> = [];
     const fetchImpl = (async (url: string, init?: RequestInit) => {
       calls.push({ url, method: init?.method });
@@ -75,7 +77,7 @@ describe('deleting a session from the viewer', () => {
 
     await deleteSession({ platformSource: 'codex', contentSessionId: 'thread/42' }, fetchImpl);
 
-    expect(calls).toEqual([{ url: '/api/sessions/codex/thread%2F42', method: 'DELETE' }]);
+    expect(calls).toEqual([{ url: '/api/sessions?platformSource=codex&contentSessionId=thread%2F42', method: 'DELETE' }]);
   });
 
   it('explains each refusal', async () => {

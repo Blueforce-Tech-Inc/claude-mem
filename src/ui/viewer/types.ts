@@ -4,6 +4,7 @@ export interface Observation {
   id: FeedItemId;
   memory_session_id: string;
   content_session_id: string;
+  standalone_kind?: string | null;
   project: string;
   merged_into_project?: string | null;
   platform_source: string;
